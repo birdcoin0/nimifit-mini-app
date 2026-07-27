@@ -107,7 +107,6 @@ export default function App() {
               setTempProfile(data.profile);
             }
             if (data.proUntil && data.proUntil > Date.now()) setIsPro(true);
-            if (data.nimiqAddress) setNimiqWalletAddress(data.nimiqAddress);
           } else {
             await setDoc(userRef, { profile: defaultProfile, proUntil: 0 });
           }
@@ -141,12 +140,18 @@ export default function App() {
     }
   };
 
+  const nimiqRef = { current: null };
   const handleNimiqConnect = async () => {
-    setTimeout(async () => {
-      const mockAddress = "NQ63 73V9 H5T3 K98X B2MD NIM";
-      setNimiqWalletAddress(mockAddress);
-      if (user) await setDoc(doc(db, "users", user.uid), { nimiqAddress: mockAddress }, { merge: true });
-    }, 800);
+    const nimiq = window.__nimiqInstance;
+    if (!nimiq) { alert("Nimiq Pay wallet not available. Open this app from inside Nimiq Pay."); return; }
+    try {
+      const accounts = await nimiq.listAccounts();
+      const address = Array.isArray(accounts) ? accounts[0] : null;
+      if (address) {
+        setNimiqWalletAddress(address);
+        if (user) await setDoc(doc(db, "users", user.uid), { nimiqAddress: address }, { merge: true });
+      }
+    } catch (err) { console.error(err); }
   };
 
   const handleNimiqCheckout = () => {
@@ -731,3 +736,4 @@ export default function App() {
     </div>
   );
 }
+
