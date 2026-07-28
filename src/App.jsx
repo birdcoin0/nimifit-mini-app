@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
 import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { doc, getDoc, setDoc, collection, query, orderBy, limit, getDocs } from "firebase/firestore";
 import { auth, db, googleProvider } from "./lib/firebase";
 import RingProgress from "./components/RingProgress";
 import { init } from "@nimiq/mini-app-sdk";
@@ -86,6 +86,42 @@ function getMonthKey(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
+function Leaderboard({ entries, valueKey, valueSuffix, currentUid, dark }) {
+  if (!entries || entries.length === 0) {
+    return (
+      <p style={{ fontSize: "10.5px", marginTop: "12px", opacity: 0.75, fontFamily: "'IBM Plex Mono', monospace" }}>
+        No entries yet — be the first!
+      </p>
+    );
+  }
+  const sorted = [...entries].sort((a, b) => (b[valueKey] || 0) - (a[valueKey] || 0)).slice(0, 5);
+  return (
+    <div style={{
+      marginTop: "12px", borderRadius: "8px", overflow: "hidden",
+      background: dark ? "rgba(27,36,48,0.08)" : "rgba(0,0,0,0.15)",
+    }}>
+      {sorted.map((entry, i) => (
+        <div
+          key={entry.displayName + i}
+          style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            padding: "6px 10px", fontFamily: "'IBM Plex Mono', monospace", fontSize: "11px",
+            borderBottom: i < sorted.length - 1 ? "1px solid rgba(255,255,255,0.08)" : "none",
+          }}
+        >
+          <span style={{ display: "flex", alignItems: "center", gap: "6px", overflow: "hidden" }}>
+            <span style={{ opacity: 0.8 }}>{i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`}</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {entry.displayName === currentUid ? "You" : (entry.displayName || "Anonymous")}
+            </span>
+          </span>
+          <span style={{ fontWeight: 700 }}>{entry[valueKey]}{valueSuffix}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
 
   const [user, setUser] = useState(null);
@@ -132,9 +168,56 @@ export default function App() {
   const [monthlyTicketsEarned, setMonthlyTicketsEarned] = useState(0);
   const [weeklyNimEntered, setWeeklyNimEntered] = useState(false);
   const [monthlyNimEntered, setMonthlyNimEntered] = useState(false);
-  const NIM_COMPETITION_ENTRY = 1; // NIM taken from gift balance to join a NIM competition
+  const NIM_COMPETITION_ENTRY = 1; // default suggested stake, user can enter more
   const WEEKLY_WINNER_BONUS_PCT = 0.10;
   const MONTHLY_WINNER_BONUS_PCT = 0.40;
+
+  // Leaderboards: top entries per competition, fetched on demand from Firestore.
+  const [weeklyTicketsLeaderboard, setWeeklyTicketsLeaderboard] = useState([]);
+  const [monthlyTicketsLeaderboard, setMonthlyTicketsLeaderboard] = useState([]);
+  const [weeklyNimLeaderboard, setWeeklyNimLeaderboard] = useState([]);
+  const [monthlyNimLeaderboard, setMonthlyNimLeaderboard] = useState([]);
+  const [leaderboardsLoading, setLeaderboardsLoading] = useState(false);
+
+  // User-chosen stake amounts for the two NIM competitions (defaults to the
+  // suggested entry above, but the person can enter any amount they want).
+  const [weeklyNimStakeInput, setWeeklyNimStakeInput] = useState(String(NIM_COMPETITION_ENTRY));
+  const [monthlyNimStakeInput, setMonthlyNimStakeInput] = useState(String(NIM_COMPETITION_ENTRY));
+
+  const [currentPage, setCurrentPage] = useState("home"); // "home" | "competitions" | "profile"
+  const [countdownTick, setCountdownTick] = useState(Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => setCountdownTick(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  function getWeeklyCountdown() {
+    // Must match getWeekKey's Saturday-based reset, or the timer shown here
+    // will disagree with when tickets/NIM entries actually reset.
+    const now = new Date(countdownTick);
+    const day = now.getDay(); // 0=Sun, 6=Sat
+    const daysUntilSat = (6 - day + 7) % 7 || 7;
+    const nextSaturday = new Date(now);
+    nextSaturday.setDate(now.getDate() + daysUntilSat);
+    nextSaturday.setHours(0, 0, 0, 0);
+    const diff = Math.max(0, nextSaturday - now);
+    const d = Math.floor(diff / 86400000);
+    const h = Math.floor((diff % 86400000) / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    const s = Math.floor((diff % 60000) / 1000);
+    return { d, h, m, s, label: `${d}d ${h}h ${m}m ${s}s` };
+  }
+
+  function getMonthlyCountdown() {
+    const now = new Date(countdownTick);
+    const firstOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
+    const diff = Math.max(0, firstOfNextMonth - now);
+    const d = Math.floor(diff / 86400000);
+    const h = Math.floor((diff % 86400000) / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    return { d, h, m, label: `${d}d ${h}h ${m}m` };
+  }
 
   const nimiqRef = useRef(null);
   const [nimiqReady, setNimiqReady] = useState(false);
@@ -372,37 +455,70 @@ export default function App() {
     });
   };
 
+  const fetchLeaderboards = async () => {
+    setLeaderboardsLoading(true);
+    try {
+      const weekKey = getWeekKey();
+      const monthKey = getMonthKey();
+
+      const [wTickets, mTickets, wNim, mNim] = await Promise.all([
+        getDocs(query(collection(db, "competitions_weekly_tickets", weekKey, "entries"), orderBy("ticketsEarned", "desc"), limit(10))),
+        getDocs(query(collection(db, "competitions_monthly_tickets", monthKey, "entries"), orderBy("ticketsEarned", "desc"), limit(10))),
+        getDocs(query(collection(db, "competitions_weekly_nim", weekKey, "entries"), orderBy("stake", "desc"), limit(10))),
+        getDocs(query(collection(db, "competitions_monthly_nim", monthKey, "entries"), orderBy("stake", "desc"), limit(10))),
+      ]);
+
+      setWeeklyTicketsLeaderboard(wTickets.docs.map((d) => d.data()));
+      setMonthlyTicketsLeaderboard(mTickets.docs.map((d) => d.data()));
+      setWeeklyNimLeaderboard(wNim.docs.map((d) => d.data()));
+      setMonthlyNimLeaderboard(mNim.docs.map((d) => d.data()));
+    } catch (err) {
+      console.error("Failed to load leaderboards:", err);
+    } finally {
+      setLeaderboardsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (currentPage === "competitions") fetchLeaderboards();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage]);
+
   const handleJoinWeeklyNimCompetition = async () => {
-    if (nimGiftBalance < NIM_COMPETITION_ENTRY || weeklyNimEntered) return;
-    const newBalance = nimGiftBalance - NIM_COMPETITION_ENTRY;
+    const stake = parseFloat(weeklyNimStakeInput);
+    if (!Number.isFinite(stake) || stake <= 0 || stake > nimGiftBalance || weeklyNimEntered) return;
+    const newBalance = nimGiftBalance - stake;
     setNimGiftBalance(newBalance);
     setWeeklyNimEntered(true);
     if (user) {
       const weekKey = getWeekKey();
       await setDoc(doc(db, "users", user.uid), { nimGiftBalance: newBalance, weeklyNimEntered: true, weeklyPeriod: weekKey }, { merge: true });
       await setDoc(doc(db, "competitions_weekly_nim", weekKey, "entries", user.uid), {
-        stake: NIM_COMPETITION_ENTRY,
+        stake,
         ticketsEarned: weeklyTicketsEarned,
         displayName: user.email || "Anonymous",
         updatedAt: Date.now(),
       }, { merge: true });
+      fetchLeaderboards();
     }
   };
 
   const handleJoinMonthlyNimCompetition = async () => {
-    if (nimGiftBalance < NIM_COMPETITION_ENTRY || monthlyNimEntered) return;
-    const newBalance = nimGiftBalance - NIM_COMPETITION_ENTRY;
+    const stake = parseFloat(monthlyNimStakeInput);
+    if (!Number.isFinite(stake) || stake <= 0 || stake > nimGiftBalance || monthlyNimEntered) return;
+    const newBalance = nimGiftBalance - stake;
     setNimGiftBalance(newBalance);
     setMonthlyNimEntered(true);
     if (user) {
       const monthKey = getMonthKey();
       await setDoc(doc(db, "users", user.uid), { nimGiftBalance: newBalance, monthlyNimEntered: true, monthlyPeriod: monthKey }, { merge: true });
       await setDoc(doc(db, "competitions_monthly_nim", monthKey, "entries", user.uid), {
-        stake: NIM_COMPETITION_ENTRY,
+        stake,
         ticketsEarned: monthlyTicketsEarned,
         displayName: user.email || "Anonymous",
         updatedAt: Date.now(),
       }, { merge: true });
+      fetchLeaderboards();
     }
   };
 
@@ -650,12 +766,14 @@ export default function App() {
   return (
     <div style={styles.page}>
       <style>{FONTS}</style>
-      <div style={styles.container}>
+      <div style={{ ...styles.container, paddingBottom: "70px" }}>
 
+        {currentPage === "home" && (
+        <>
         <div style={styles.header}>
           <span style={styles.brandMark}>NimiFit</span>
           <div style={styles.headerActions}>
-            <button style={styles.iconButton} onClick={() => setIsEditingProfile(true)} title="Profile & goals" aria-label="Profile & goals">
+            <button style={styles.iconButton} onClick={() => setCurrentPage("profile")} title="Profile & goals" aria-label="Profile & goals">
               <IconSettings size={15} />
             </button>
             <span style={styles.iconButtonActive} title={`${tickets} tickets`}>
@@ -774,120 +892,6 @@ export default function App() {
             </p>
           </div>
         </div>
-
-        <div style={styles.ticket}>
-          <div style={styles.ticketPad}>
-            <div style={{ ...styles.eyebrow, marginBottom: "14px" }}>Competitions</div>
-
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${line}` }}>
-              <div>
-                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Touch Grass (Weekly · Tickets)</div>
-                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Sat–Sun · winner gets +{WEEKLY_WINNER_BONUS_PCT * 100}%</div>
-              </div>
-              <div style={{ fontFamily: "'Fraunces', serif", fontSize: "16px", fontWeight: 700, color: gold }}>{weeklyTicketsEarned}</div>
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${line}` }}>
-              <div>
-                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Monthly Challenge (Tickets)</div>
-                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Calendar month · winner gets +{MONTHLY_WINNER_BONUS_PCT * 100}%</div>
-              </div>
-              <div style={{ fontFamily: "'Fraunces', serif", fontSize: "16px", fontWeight: 700, color: gold }}>{monthlyTicketsEarned}</div>
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${line}` }}>
-              <div>
-                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Touch Grass (Weekly · NIM)</div>
-                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Entry: {NIM_COMPETITION_ENTRY} NIM from gift balance</div>
-              </div>
-              {weeklyNimEntered ? (
-                <span style={{ fontSize: "10.5px", color: moss, fontFamily: "'IBM Plex Mono', monospace" }}>Joined ✓</span>
-              ) : (
-                <button
-                  style={{ ...styles.ghostButton, width: "auto", marginTop: 0, padding: "6px 12px", fontSize: "10px" }}
-                  disabled={nimGiftBalance < NIM_COMPETITION_ENTRY}
-                  onClick={handleJoinWeeklyNimCompetition}
-                >
-                  Join
-                </button>
-              )}
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0" }}>
-              <div>
-                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Monthly Challenge (NIM)</div>
-                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Entry: {NIM_COMPETITION_ENTRY} NIM from gift balance</div>
-              </div>
-              {monthlyNimEntered ? (
-                <span style={{ fontSize: "10.5px", color: moss, fontFamily: "'IBM Plex Mono', monospace" }}>Joined ✓</span>
-              ) : (
-                <button
-                  style={{ ...styles.ghostButton, width: "auto", marginTop: 0, padding: "6px 12px", fontSize: "10px" }}
-                  disabled={nimGiftBalance < NIM_COMPETITION_ENTRY}
-                  onClick={handleJoinMonthlyNimCompetition}
-                >
-                  Join
-                </button>
-              )}
-            </div>
-
-            {nimGiftBalance < NIM_COMPETITION_ENTRY && (
-              <p style={{ fontSize: "10.5px", color: "#9A9484", marginTop: "8px" }}>
-                Subscribe via Nimiq Pay to earn gift balance and join NIM competitions.
-              </p>
-            )}
-          </div>
-        </div>
-
-        {isEditingProfile && (
-          <div style={{ ...styles.ticket, padding: "20px" }}>
-            <div style={{ ...styles.eyebrow, color: rust, marginBottom: "12px" }}>Profile &amp; Goals</div>
-            <form onSubmit={handleSaveProfile}>
-              <div style={{ display: "flex", gap: "10px" }}>
-                <div style={{ flex: 1 }}>
-                  <label style={styles.labelStyle}>Weight (kg)</label>
-                  <input type="number" style={styles.inputStyle} value={tempProfile.weightKg} onChange={(e) => setTempProfile({ ...tempProfile, weightKg: Number(e.target.value) })} />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label style={styles.labelStyle}>Target weight (kg)</label>
-                  <input type="number" style={styles.inputStyle} value={tempProfile.goalWeightKg} onChange={(e) => setTempProfile({ ...tempProfile, goalWeightKg: Number(e.target.value) })} />
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: "10px" }}>
-                <div style={{ flex: 1 }}>
-                  <label style={styles.labelStyle}>Height (cm)</label>
-                  <input type="number" style={styles.inputStyle} value={tempProfile.heightCm} onChange={(e) => setTempProfile({ ...tempProfile, heightCm: Number(e.target.value) })} />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label style={styles.labelStyle}>Age</label>
-                  <input type="number" style={styles.inputStyle} value={tempProfile.age} onChange={(e) => setTempProfile({ ...tempProfile, age: Number(e.target.value) })} />
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: "10px" }}>
-                <div style={{ flex: 1 }}>
-                  <label style={styles.labelStyle}>Gender</label>
-                  <select style={styles.inputStyle} value={tempProfile.gender} onChange={(e) => setTempProfile({ ...tempProfile, gender: e.target.value })}>
-                    <option value="male">Male</option>
-                    <option value="female">Female</option>
-                  </select>
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label style={styles.labelStyle}>Activity</label>
-                  <select style={styles.inputStyle} value={tempProfile.activity} onChange={(e) => setTempProfile({ ...tempProfile, activity: e.target.value })}>
-                    <option value="sedentary">Sedentary</option>
-                    <option value="light">Light</option>
-                    <option value="moderate">Moderate</option>
-                    <option value="active">Active</option>
-                  </select>
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
-                <button type="submit" style={{ ...styles.ctaButton, marginTop: 0, padding: "10px" }}>Save profile</button>
-                <button type="button" style={{ ...styles.ghostButton, marginTop: 0, padding: "10px" }} onClick={() => setIsEditingProfile(false)}>Cancel</button>
-              </div>
-            </form>
-          </div>
-        )}
 
         <div style={styles.ticket}>
           <div style={{ ...styles.ticketPad, paddingBottom: "16px" }}>
@@ -1087,7 +1091,243 @@ export default function App() {
             )}
           </div>
         </div>
+        </>
+        )}
 
+        {currentPage === "competitions" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+            <div style={{ padding: "0 4px 6px" }}>
+              <span style={styles.brandMark}>🏆 Competitions</span>
+            </div>
+
+            {leaderboardsLoading && (
+              <p style={{ fontSize: "10.5px", color: "#9A9484", textAlign: "center", fontFamily: "'IBM Plex Mono', monospace" }}>Loading leaderboards…</p>
+            )}
+
+            {/* Weekly Tickets */}
+            <div style={{
+              background: `linear-gradient(135deg, ${rust}, #8a3a20)`, borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(181,80,46,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Touch Grass · Weekly · Free Entry</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>{weeklyTicketsEarned} tickets</div>
+                </div>
+                <div style={{ fontSize: "22px" }}>🎟️</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getWeeklyCountdown().label}
+              </div>
+              <div style={{ fontSize: "11px", marginTop: "10px", opacity: 0.9 }}>Winner earns +{WEEKLY_WINNER_BONUS_PCT * 100}% bonus tickets. Automatically entered — just keep scanning meals and logging water.</div>
+              <Leaderboard entries={weeklyTicketsLeaderboard} valueKey="ticketsEarned" valueSuffix=" tickets" currentUid={user?.uid} />
+            </div>
+
+            {/* Monthly Tickets */}
+            <div style={{
+              background: `linear-gradient(135deg, ${gold}, #7a6234)`, borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(169,138,75,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Monthly Challenge · Free Entry</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>{monthlyTicketsEarned} tickets</div>
+                </div>
+                <div style={{ fontSize: "22px" }}>🏅</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getMonthlyCountdown().label}
+              </div>
+              <div style={{ fontSize: "11px", marginTop: "10px", opacity: 0.9 }}>Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus tickets. Automatically entered.</div>
+              <Leaderboard entries={monthlyTicketsLeaderboard} valueKey="ticketsEarned" valueSuffix=" tickets" currentUid={user?.uid} />
+            </div>
+
+            {/* Weekly NIM */}
+            <div style={{
+              background: `linear-gradient(135deg, ${nimiqOrange}, #b8860f)`, borderRadius: "14px", padding: "20px",
+              color: "#1B2430", boxShadow: "0 8px 20px rgba(233,178,19,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.75, textTransform: "uppercase" }}>Touch Grass · Weekly · NIM Stakes</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>Stake what you want</div>
+                </div>
+                <div style={{ fontSize: "22px" }}>💰</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.12)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getWeeklyCountdown().label}
+              </div>
+              {weeklyNimEntered ? (
+                <div style={{ marginTop: "12px", textAlign: "center", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700 }}>✓ You're in — good luck!</div>
+              ) : (
+                <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    max={nimGiftBalance}
+                    value={weeklyNimStakeInput}
+                    onChange={(e) => setWeeklyNimStakeInput(e.target.value)}
+                    style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "1px solid rgba(27,36,48,0.25)", background: "rgba(255,255,255,0.5)", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", color: "#1B2430", boxSizing: "border-box" }}
+                  />
+                  <button
+                    style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: "#1B2430", color: "#F5F3EC", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+                    disabled={!(parseFloat(weeklyNimStakeInput) > 0) || parseFloat(weeklyNimStakeInput) > nimGiftBalance}
+                    onClick={handleJoinWeeklyNimCompetition}
+                  >
+                    Enter
+                  </button>
+                </div>
+              )}
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.75 }}>Gift balance: {nimGiftBalance.toFixed(2)} NIM</p>
+              <Leaderboard entries={weeklyNimLeaderboard} valueKey="stake" valueSuffix=" NIM" currentUid={user?.uid} dark />
+            </div>
+
+            {/* Monthly NIM */}
+            <div style={{
+              background: `linear-gradient(135deg, ${moss}, #33452f)`, borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(86,112,90,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Monthly Challenge · NIM Stakes</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>Stake what you want</div>
+                </div>
+                <div style={{ fontSize: "22px" }}>👑</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getMonthlyCountdown().label}
+              </div>
+              {monthlyNimEntered ? (
+                <div style={{ marginTop: "12px", textAlign: "center", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700 }}>✓ You're in — good luck!</div>
+              ) : (
+                <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    max={nimGiftBalance}
+                    value={monthlyNimStakeInput}
+                    onChange={(e) => setMonthlyNimStakeInput(e.target.value)}
+                    style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.3)", background: "rgba(255,255,255,0.12)", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", color: "#F5F3EC", boxSizing: "border-box" }}
+                  />
+                  <button
+                    style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: "#F5F3EC", color: moss, fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+                    disabled={!(parseFloat(monthlyNimStakeInput) > 0) || parseFloat(monthlyNimStakeInput) > nimGiftBalance}
+                    onClick={handleJoinMonthlyNimCompetition}
+                  >
+                    Enter
+                  </button>
+                </div>
+              )}
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.8 }}>Gift balance: {nimGiftBalance.toFixed(2)} NIM</p>
+              <Leaderboard entries={monthlyNimLeaderboard} valueKey="stake" valueSuffix=" NIM" currentUid={user?.uid} />
+            </div>
+
+            <p style={{ fontSize: "11px", color: "#9A9484", textAlign: "center", padding: "0 10px" }}>
+              NIM gift balance: {nimGiftBalance.toFixed(2)} NIM — earned automatically from your Nimiq Pay subscription.
+            </p>
+          </div>
+        )}
+
+        {currentPage === "profile" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+            <div style={{ padding: "0 4px 6px" }}>
+              <span style={styles.brandMark}>Profile</span>
+            </div>
+            <div style={styles.ticket}>
+              <div style={styles.ticketPad}>
+                <div style={styles.eyebrow}>Account</div>
+                {user ? (
+                  <>
+                    <p style={{ fontSize: "13px", color: ink, margin: "8px 0 16px" }}>{user.email}</p>
+                    <button style={styles.ghostButton} onClick={() => signOut(auth)}>
+                      <IconLogout size={13} style={{ marginRight: "6px" }} /> Log out
+                    </button>
+                  </>
+                ) : (
+                  <p style={{ fontSize: "13px", color: "#6B6656" }}>Sign in from the Home tab to save your progress.</p>
+                )}
+              </div>
+            </div>
+            <div style={styles.ticket}>
+              <div style={styles.ticketPad}>
+                <div style={{ ...styles.eyebrow, color: rust, marginBottom: "12px" }}>Profile &amp; Goals</div>
+                <form onSubmit={handleSaveProfile}>
+                  <div style={{ display: "flex", gap: "10px" }}>
+                    <div style={{ flex: 1 }}>
+                      <label style={styles.labelStyle}>Weight (kg)</label>
+                      <input type="number" style={styles.inputStyle} value={tempProfile.weightKg} onChange={(e) => setTempProfile({ ...tempProfile, weightKg: Number(e.target.value) })} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <label style={styles.labelStyle}>Target weight (kg)</label>
+                      <input type="number" style={styles.inputStyle} value={tempProfile.goalWeightKg} onChange={(e) => setTempProfile({ ...tempProfile, goalWeightKg: Number(e.target.value) })} />
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: "10px" }}>
+                    <div style={{ flex: 1 }}>
+                      <label style={styles.labelStyle}>Height (cm)</label>
+                      <input type="number" style={styles.inputStyle} value={tempProfile.heightCm} onChange={(e) => setTempProfile({ ...tempProfile, heightCm: Number(e.target.value) })} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <label style={styles.labelStyle}>Age</label>
+                      <input type="number" style={styles.inputStyle} value={tempProfile.age} onChange={(e) => setTempProfile({ ...tempProfile, age: Number(e.target.value) })} />
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: "10px" }}>
+                    <div style={{ flex: 1 }}>
+                      <label style={styles.labelStyle}>Gender</label>
+                      <select style={styles.inputStyle} value={tempProfile.gender} onChange={(e) => setTempProfile({ ...tempProfile, gender: e.target.value })}>
+                        <option value="male">Male</option>
+                        <option value="female">Female</option>
+                      </select>
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <label style={styles.labelStyle}>Activity</label>
+                      <select style={styles.inputStyle} value={tempProfile.activity} onChange={(e) => setTempProfile({ ...tempProfile, activity: e.target.value })}>
+                        <option value="sedentary">Sedentary</option>
+                        <option value="light">Light</option>
+                        <option value="moderate">Moderate</option>
+                        <option value="active">Active</option>
+                      </select>
+                    </div>
+                  </div>
+                  <button type="submit" style={{ ...styles.ctaButton, marginTop: "10px" }}>Save profile</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </div>
+
+      {/* Bottom navigation */}
+      <div style={{
+        position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 100,
+        display: "flex", justifyContent: "center", background: "#FBFAF7",
+        borderTop: `1px solid ${line}`, padding: "10px 0",
+      }}>
+        <div style={{ display: "flex", width: "100%", maxWidth: "440px", justifyContent: "space-around" }}>
+          {[
+            { key: "home", label: "Home", icon: "🏠" },
+            { key: "competitions", label: "Compete", icon: "🏆" },
+            { key: "profile", label: "Profile", icon: "⚙️" },
+          ].map((tab) => (
+            <button
+              key={tab.key}
+              onClick={() => setCurrentPage(tab.key)}
+              style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: "2px",
+                background: "none", border: "none", cursor: "pointer",
+                color: currentPage === tab.key ? rust : "#9A9484",
+                fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", fontWeight: currentPage === tab.key ? 700 : 500,
+              }}
+            >
+              <span style={{ fontSize: "18px" }}>{tab.icon}</span>
+              {tab.label}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );
