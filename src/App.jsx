@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { auth, db, googleProvider } from "./lib/firebase";
 import RingProgress from "./components/RingProgress";
@@ -94,35 +94,31 @@ export default function App() {
   const [aiCoachTip, setAiCoachTip] = useState("Scan your first meal to let Gemini analyze your daily nutrition targets!");
   const [isAnalyzingCoach, setIsAnalyzingCoach] = useState(false);
 
+  // Email/password auth as a fallback to Google sign-in, which can fail
+  // inside WebViews (e.g. Nimiq Pay) since popups are often blocked there.
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authMode, setAuthMode] = useState("login"); // "login" | "signup"
+  const [authError, setAuthError] = useState("");
+
+  // Tickets: earned from real app usage. Meal = 10, water glass = 5,
+  // first-ever login = 100 bonus. 3700 tickets = one free month subscription.
+  const [tickets, setTickets] = useState(0);
+  const TICKETS_PER_MEAL = 10;
+  const TICKETS_PER_WATER = 5;
+  const LOGIN_BONUS_TICKETS = 100;
+  const TICKETS_FOR_FREE_MONTH = 3700;
+
   const nimiqRef = useRef(null);
   const [nimiqReady, setNimiqReady] = useState(false);
-  const [networkDebugInfo, setNetworkDebugInfo] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
     init()
-      .then(async (nimiq) => {
+      .then((nimiq) => {
         if (cancelled) return;
         nimiqRef.current = nimiq;
         setNimiqReady(true);
-
-        // TEMPORARY DEBUG: reveal what the SDK exposes so we can confirm
-        // testnet vs mainnet. Remove this block once confirmed.
-        try {
-          const info = {
-            keys: Object.keys(nimiq),
-          };
-          if (typeof nimiq.getBlockNumber === "function") {
-            info.blockNumber = await nimiq.getBlockNumber();
-          }
-          if (typeof nimiq.isConsensusEstablished === "function") {
-            info.consensus = await nimiq.isConsensusEstablished();
-          }
-          setNetworkDebugInfo(info);
-          console.log("NIMIQ DEBUG INFO:", info);
-        } catch (e) {
-          console.log("NIMIQ DEBUG ERROR:", e);
-        }
       })
       .catch((err) => {
         console.warn("Nimiq Mini App SDK not available in this context:", err);
@@ -148,8 +144,11 @@ export default function App() {
             if (data.proUntil && data.proUntil > Date.now()) setIsPro(true);
             // nimiqAddress is intentionally NOT restored from Firestore here —
             // the wallet address is only ever set from a live listAccounts() call.
+            setTickets(typeof data.tickets === "number" ? data.tickets : 0);
           } else {
-            await setDoc(userRef, { profile: defaultProfile, proUntil: 0 });
+            // Brand-new account: grant the one-time login bonus.
+            await setDoc(userRef, { profile: defaultProfile, proUntil: 0, tickets: LOGIN_BONUS_TICKETS });
+            setTickets(LOGIN_BONUS_TICKETS);
           }
         } catch (e) {
           console.error(e);
@@ -176,6 +175,29 @@ export default function App() {
     } catch (error) {
       console.error(error);
       alert("Error login Firebase: " + error.message);
+    }
+  };
+
+  const handleEmailAuth = async (e) => {
+    e.preventDefault();
+    setAuthError("");
+    try {
+      if (authMode === "signup") {
+        await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+      } else {
+        await signInWithEmailAndPassword(auth, authEmail, authPassword);
+      }
+    } catch (error) {
+      console.error(error);
+      const friendly = {
+        "auth/invalid-email": "Invalid email address.",
+        "auth/user-not-found": "No account found with this email. Try signing up instead.",
+        "auth/wrong-password": "Incorrect password.",
+        "auth/invalid-credential": "Incorrect email or password.",
+        "auth/email-already-in-use": "An account already exists with this email. Try logging in instead.",
+        "auth/weak-password": "Password must be at least 6 characters.",
+      };
+      setAuthError(friendly[error.code] || error.message);
     }
   };
 
@@ -217,6 +239,17 @@ export default function App() {
     }
   };
 
+  const handleRedeemTicketsForMonth = async () => {
+    if (tickets < TICKETS_FOR_FREE_MONTH) return;
+    const remaining = tickets - TICKETS_FOR_FREE_MONTH;
+    const expiry = Date.now() + 30 * 24 * 60 * 60 * 1000;
+    setTickets(remaining);
+    setIsPro(true);
+    if (user) {
+      await setDoc(doc(db, "users", user.uid), { tickets: remaining, proUntil: expiry }, { merge: true });
+    }
+  };
+
   const handleNimiqCheckout = async () => {
     const nimiq = nimiqRef.current;
     if (!nimiq) {
@@ -245,7 +278,23 @@ export default function App() {
     }
   };
 
-  const setWaterTo = (n) => setGlassesDrunk(Math.max(0, n));
+  const awardTickets = async (amount) => {
+    setTickets((prev) => {
+      const next = prev + amount;
+      if (user) {
+        setDoc(doc(db, "users", user.uid), { tickets: next }, { merge: true }).catch((err) =>
+          console.error("Failed to save tickets:", err)
+        );
+      }
+      return next;
+    });
+  };
+
+  const setWaterTo = (n) => {
+    const wasBelow = n > glassesDrunk;
+    setGlassesDrunk(Math.max(0, n));
+    if (wasBelow) awardTickets(TICKETS_PER_WATER);
+  };
 
   const caloriesCurrent = todayMeals.reduce((sum, m) => sum + (Number(m.calories) || 0), 0);
   const caloriesGoal = computeCalorieGoal(profile);
@@ -356,6 +405,7 @@ export default function App() {
         setMealData(newMeal);
         setTodayMeals(updatedMeals);
         setScanState("done");
+        awardTickets(TICKETS_PER_MEAL);
 
         fetchAiCoachTip(updatedMeals);
       } catch (err) {
@@ -470,18 +520,7 @@ export default function App() {
   return (
     <div style={styles.page}>
       <style>{FONTS}</style>
-
-      {networkDebugInfo && (
-        <div style={{
-          position: "fixed", top: 0, left: 0, right: 0, zIndex: 9999,
-          background: "#1B2430", color: "#F2F1EC", fontFamily: "monospace",
-          fontSize: "10px", padding: "6px 10px", wordBreak: "break-all",
-        }}>
-          NIMIQ DEBUG: {JSON.stringify(networkDebugInfo)}
-        </div>
-      )}
-
-      <div style={{ ...styles.container, marginTop: networkDebugInfo ? "40px" : "0" }}>
+      <div style={styles.container}>
 
         <div style={styles.header}>
           <span style={styles.brandMark}>NimiFit</span>
@@ -517,10 +556,42 @@ export default function App() {
             {!user ? (
               <div>
                 <p style={{ ...styles.heroSubtitle, marginBottom: "12px", fontSize: "12px" }}>
-                  Sign in with Google to save your data across devices.
+                  Sign in to save your data across devices.
                 </p>
-                <button style={styles.ctaButton} onClick={handleGoogleLogin}>
-                  <IconGoogle size={13} /> Sign in with Google
+                <form onSubmit={handleEmailAuth}>
+                  <input
+                    type="email"
+                    placeholder="Email"
+                    style={styles.inputStyle}
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    required
+                  />
+                  <input
+                    type="password"
+                    placeholder="Password"
+                    style={styles.inputStyle}
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    required
+                    minLength={6}
+                  />
+                  {authError && (
+                    <p style={{ color: rust, fontSize: "11.5px", margin: "-4px 0 10px" }}>{authError}</p>
+                  )}
+                  <button type="submit" style={{ ...styles.ctaButton, marginTop: 0 }}>
+                    {authMode === "signup" ? "Create account" : "Log in"}
+                  </button>
+                </form>
+                <button
+                  type="button"
+                  style={{ ...styles.ghostButton, marginTop: "10px" }}
+                  onClick={() => { setAuthMode(authMode === "signup" ? "login" : "signup"); setAuthError(""); }}
+                >
+                  {authMode === "signup" ? "Already have an account? Log in" : "New here? Create an account"}
+                </button>
+                <button style={{ ...styles.pillButton, width: "100%", justifyContent: "center", marginTop: "10px" }} onClick={handleGoogleLogin}>
+                  <IconGoogle size={13} /> Sign in with Google instead
                 </button>
               </div>
             ) : isPro ? (
@@ -542,6 +613,29 @@ export default function App() {
                 )}
               </div>
             )}
+          </div>
+        </div>
+
+        <div style={styles.ticket}>
+          <div style={styles.ticketPad}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+              <span style={styles.eyebrow}>Tickets</span>
+              <span style={{ fontFamily: "'Fraunces', serif", fontSize: "20px", fontWeight: 700, color: gold }}>{tickets}</span>
+            </div>
+            <div style={{ height: "8px", borderRadius: "4px", background: "#EDEBE3", overflow: "hidden" }}>
+              <div style={{
+                height: "100%",
+                width: `${Math.min(100, Math.round((tickets / TICKETS_FOR_FREE_MONTH) * 100))}%`,
+                background: gold,
+                transition: "width 0.4s ease",
+              }} />
+            </div>
+            <p style={{ fontSize: "11px", color: "#9A9484", marginTop: "8px", fontFamily: "'IBM Plex Mono', monospace" }}>
+              {tickets} / {TICKETS_FOR_FREE_MONTH} — {Math.min(100, Math.round((tickets / TICKETS_FOR_FREE_MONTH) * 100))}% to a free month
+            </p>
+            <p style={{ fontSize: "11px", color: "#6B6656", marginTop: "6px" }}>
+              +{TICKETS_PER_MEAL} per meal scanned · +{TICKETS_PER_WATER} per glass of water
+            </p>
           </div>
         </div>
 
@@ -799,4 +893,4 @@ export default function App() {
       </div>
     </div>
   );
-} 
+}
