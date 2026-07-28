@@ -3,6 +3,7 @@ import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { auth, db, googleProvider } from "./lib/firebase";
 import RingProgress from "./components/RingProgress";
+import { init } from "@nimiq/mini-app-sdk";
 import {
   IconSettings, IconWallet, IconFlame, IconDrumstick, IconWheat, IconDroplet,
   IconLock, IconCheck, IconLogout, IconGoogle, IconPlus, IconMinus,
@@ -93,6 +94,44 @@ export default function App() {
   const [aiCoachTip, setAiCoachTip] = useState("Scan your first meal to let Gemini analyze your daily nutrition targets!");
   const [isAnalyzingCoach, setIsAnalyzingCoach] = useState(false);
 
+  const nimiqRef = useRef(null);
+  const [nimiqReady, setNimiqReady] = useState(false);
+  const [networkDebugInfo, setNetworkDebugInfo] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    init()
+      .then(async (nimiq) => {
+        if (cancelled) return;
+        nimiqRef.current = nimiq;
+        setNimiqReady(true);
+
+        // TEMPORARY DEBUG: reveal what the SDK exposes so we can confirm
+        // testnet vs mainnet. Remove this block once confirmed.
+        try {
+          const info = {
+            keys: Object.keys(nimiq),
+          };
+          if (typeof nimiq.getBlockNumber === "function") {
+            info.blockNumber = await nimiq.getBlockNumber();
+          }
+          if (typeof nimiq.isConsensusEstablished === "function") {
+            info.consensus = await nimiq.isConsensusEstablished();
+          }
+          setNetworkDebugInfo(info);
+          console.log("NIMIQ DEBUG INFO:", info);
+        } catch (e) {
+          console.log("NIMIQ DEBUG ERROR:", e);
+        }
+      })
+      .catch((err) => {
+        console.warn("Nimiq Mini App SDK not available in this context:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
@@ -107,6 +146,8 @@ export default function App() {
               setTempProfile(data.profile);
             }
             if (data.proUntil && data.proUntil > Date.now()) setIsPro(true);
+            // nimiqAddress is intentionally NOT restored from Firestore here —
+            // the wallet address is only ever set from a live listAccounts() call.
           } else {
             await setDoc(userRef, { profile: defaultProfile, proUntil: 0 });
           }
@@ -117,6 +158,17 @@ export default function App() {
     });
     return () => unsubscribe();
   }, []);
+
+  const handleDisconnectWallet = async () => {
+    setNimiqWalletAddress(null);
+    if (user) {
+      try {
+        await setDoc(doc(db, "users", user.uid), { nimiqAddress: null }, { merge: true });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  };
 
   const handleGoogleLogin = async () => {
     try {
@@ -140,10 +192,16 @@ export default function App() {
     }
   };
 
-  const nimiqRef = { current: null };
+  const NIMIQ_APP_RECEIVING_ADDRESS = "NQ78 SF1K A42M CPT7 0LDP YT52 A747 8DB6 PX7P";
+  const PRO_PRICE_NIM = 50;
+  const LUNAS_PER_NIM = 1e5;
+
   const handleNimiqConnect = async () => {
-    const nimiq = window.__nimiqInstance;
-    if (!nimiq) { alert("Nimiq Pay wallet not available. Open this app from inside Nimiq Pay."); return; }
+    const nimiq = nimiqRef.current;
+    if (!nimiq) {
+      alert("Nimiq Pay wallet isn't available here. Open this Mini App from inside the Nimiq Pay app to connect your wallet.");
+      return;
+    }
     try {
       const accounts = await nimiq.listAccounts();
       const address = Array.isArray(accounts) ? accounts[0] : null;
@@ -151,19 +209,40 @@ export default function App() {
         setNimiqWalletAddress(address);
         if (user) await setDoc(doc(db, "users", user.uid), { nimiqAddress: address }, { merge: true });
       }
-    } catch (err) { console.error(err); }
+    } catch (err) {
+      console.error(err);
+      if (err?.name !== "PermissionDeniedError") {
+        alert("Error connecting to Nimiq Pay wallet.");
+      }
+    }
   };
 
-  const handleNimiqCheckout = () => {
-    if (!nimiqWalletAddress) {
-      handleNimiqConnect();
+  const handleNimiqCheckout = async () => {
+    const nimiq = nimiqRef.current;
+    if (!nimiq) {
+      alert("Nimiq Pay wallet isn't available here. Open this Mini App from inside the Nimiq Pay app to pay with NIM.");
       return;
     }
-    setTimeout(async () => {
+    if (!nimiqWalletAddress) {
+      await handleNimiqConnect();
+    }
+    try {
+      const txHash = await nimiq.sendBasicTransaction({
+        recipient: NIMIQ_APP_RECEIVING_ADDRESS,
+        value: PRO_PRICE_NIM * LUNAS_PER_NIM,
+      });
       const expiry = Date.now() + 30 * 24 * 60 * 60 * 1000;
       setIsPro(true);
-      if (user) await setDoc(doc(db, "users", user.uid), { proUntil: expiry }, { merge: true });
-    }, 1200);
+      if (user) {
+        await setDoc(doc(db, "users", user.uid), { proUntil: expiry, lastPaymentTxHash: txHash }, { merge: true });
+      }
+    } catch (err) {
+      console.error(err);
+      if (err?.name === "PermissionDeniedError") {
+        return;
+      }
+      alert("Payment could not be completed: " + (err?.message || "unknown error"));
+    }
   };
 
   const setWaterTo = (n) => setGlassesDrunk(Math.max(0, n));
@@ -344,27 +423,21 @@ export default function App() {
       background: "transparent", color: "#8A6C0B", fontFamily: "'IBM Plex Mono', monospace", fontSize: "11px",
       letterSpacing: "0.05em", textTransform: "uppercase", fontWeight: 600,
     },
-
     weekRow: { display: "flex", justifyContent: "space-between" },
-    weekDay: (isToday) => ({
-      display: "flex", flexDirection: "column", alignItems: "center", gap: "6px",
-    }),
+    weekDay: (isToday) => ({ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" }),
     weekDayLabel: (isToday) => ({
       fontFamily: "'IBM Plex Mono', monospace", fontSize: "9.5px", letterSpacing: "0.04em",
       color: isToday ? ink : "#9A9484", fontWeight: isToday ? 700 : 500,
     }),
     weekDayNum: { fontFamily: "'Fraunces', serif", fontSize: "12px", fontWeight: 600, color: ink },
-
     ringRow: { display: "flex", alignItems: "center", gap: "18px" },
     ringLeftLabel: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.06em", color: "#9A9484", textTransform: "uppercase" },
     ringBigNumber: { fontFamily: "'Fraunces', serif", fontSize: "34px", fontWeight: 700, color: ink, lineHeight: 1 },
     ringGoalNote: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "11px", color: "#9A9484", marginTop: "4px" },
-
     macroRow: { display: "flex", justifyContent: "space-between", marginTop: "20px", paddingTop: "18px", borderTop: `1px dashed ${line}` },
     macroCol: { display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" },
     macroValue: { fontFamily: "'Fraunces', serif", fontSize: "14px", fontWeight: 600, color: ink },
     macroLabel: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "9px", letterSpacing: "0.08em", color: "#9A9484", textTransform: "uppercase" },
-
     mealRow: { display: "flex", alignItems: "center", gap: "12px", padding: "10px 0", borderBottom: `1px solid ${line}` },
     mealThumb: { width: "44px", height: "44px", borderRadius: "8px", objectFit: "cover", flexShrink: 0, border: `1px solid ${line}` },
     mealThumbPlaceholder: {
@@ -374,7 +447,6 @@ export default function App() {
     mealName: { fontFamily: "'Fraunces', serif", fontSize: "14px", fontWeight: 600, color: ink },
     mealMacros: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "10.5px", color: "#9A9484", marginTop: "2px" },
     mealCalories: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", fontWeight: 600, color: ink },
-
     waterGlassRow: { display: "flex", gap: "6px", flexWrap: "wrap", margin: "12px 0 4px" },
     waterGlass: (filled) => ({
       width: "24px", height: "32px", borderRadius: "3px 3px 8px 8px",
@@ -385,7 +457,6 @@ export default function App() {
       width: "28px", height: "28px", borderRadius: "50%", border: `1px solid ${line}`, background: "#FBFAF7",
       color: ink, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
     },
-
     inputStyle: { width: "100%", padding: "10px", margin: "6px 0 12px", background: "#F5F3EC", border: `1px solid ${line}`, borderRadius: "6px", fontFamily: "'Inter', sans-serif", fontSize: "13px", boxSizing: "border-box" },
     labelStyle: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "10.5px", color: "#6B6656", textTransform: "uppercase" },
   };
@@ -399,7 +470,18 @@ export default function App() {
   return (
     <div style={styles.page}>
       <style>{FONTS}</style>
-      <div style={styles.container}>
+
+      {networkDebugInfo && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, zIndex: 9999,
+          background: "#1B2430", color: "#F2F1EC", fontFamily: "monospace",
+          fontSize: "10px", padding: "6px 10px", wordBreak: "break-all",
+        }}>
+          NIMIQ DEBUG: {JSON.stringify(networkDebugInfo)}
+        </div>
+      )}
+
+      <div style={{ ...styles.container, marginTop: networkDebugInfo ? "40px" : "0" }}>
 
         <div style={styles.header}>
           <span style={styles.brandMark}>NimiFit</span>
@@ -412,10 +494,10 @@ export default function App() {
                 <IconWallet size={15} />
               </button>
             ) : (
-              <span style={styles.iconButtonActive} title={nimiqWalletAddress}>
+              <button style={styles.iconButtonActive} title={`${nimiqWalletAddress} — click to disconnect`} onClick={handleDisconnectWallet}>
                 <IconWallet size={13} color="#8A6C0B" />
-                {nimiqWalletAddress.slice(0, 4)}…
-              </span>
+                {String(nimiqWalletAddress).slice(0, 4)}…
+              </button>
             )}
             {user ? (
               <button style={styles.iconButton} onClick={() => signOut(auth)} title="Log out" aria-label="Log out">
@@ -453,6 +535,11 @@ export default function App() {
                 <button style={styles.nimiqPayButton} onClick={handleNimiqCheckout}>
                   <IconWallet size={14} /> Pay 50 NIM with Nimiq Pay
                 </button>
+                {!nimiqReady && (
+                  <p style={{ fontSize: "11px", color: "#9A9484", marginTop: "8px", fontFamily: "'IBM Plex Mono', monospace" }}>
+                    Nimiq wallet not detected — open this app from inside Nimiq Pay to pay.
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -688,31 +775,8 @@ export default function App() {
                   return (
                     <div key={item.dateNum} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "5px", flex: 1 }}>
                       <div style={{ fontSize: "8px", fontFamily: "'IBM Plex Mono', monospace", color: "#6B6656" }}>{item.kcal}</div>
-                      <div
-                        style={{
-                          position: "relative",
-                          width: "16px",
-                          height: "48px",
-                          borderRadius: "3px 3px 8px 8px",
-                          border: `1.5px solid ${cupColor}`,
-                          overflow: "hidden",
-                          background: "transparent",
-                        }}
-                      >
-                        <div
-                          style={{
-                            position: "absolute",
-                            bottom: 0,
-                            left: 0,
-                            right: 0,
-                            height: `${fillPct}%`,
-                            background: item.isToday
-                              ? "rgba(181,80,46,0.30)"
-                              : "rgba(86,112,90,0.22)",
-                            borderTop: `1.5px solid ${cupColor}`,
-                            transition: "height 0.5s ease",
-                          }}
-                        />
+                      <div style={{ position: "relative", width: "16px", height: "48px", borderRadius: "3px 3px 8px 8px", border: `1.5px solid ${cupColor}`, overflow: "hidden", background: "transparent" }}>
+                        <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: `${fillPct}%`, background: item.isToday ? "rgba(181,80,46,0.30)" : "rgba(86,112,90,0.22)", borderTop: `1.5px solid ${cupColor}`, transition: "height 0.5s ease" }} />
                       </div>
                       <div style={{ fontSize: "9px", fontFamily: "'IBM Plex Mono', monospace", color: item.isToday ? ink : "#9A9484", fontWeight: item.isToday ? 700 : 500 }}>{item.label}</div>
                     </div>
@@ -735,5 +799,4 @@ export default function App() {
       </div>
     </div>
   );
-}
-
+} 
