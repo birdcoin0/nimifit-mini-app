@@ -73,7 +73,21 @@ function buildWeekStrip(caloriesCurrentToday) {
   return out;
 }
 
+function getWeekKey(d = new Date()) {
+  // Competition week runs Saturday-Sunday. Find the most recent Saturday.
+  const day = d.getDay(); // 0=Sun, 6=Sat
+  const daysSinceSat = (day + 1) % 7; // Sat->0, Sun->1, Mon->2, ...
+  const sat = new Date(d);
+  sat.setDate(d.getDate() - daysSinceSat);
+  return `${sat.getFullYear()}-${String(sat.getMonth() + 1).padStart(2, "0")}-${String(sat.getDate()).padStart(2, "0")}`;
+}
+
+function getMonthKey(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
 export default function App() {
+
   const [user, setUser] = useState(null);
   const [isPro, setIsPro] = useState(false);
   const [nimiqWalletAddress, setNimiqWalletAddress] = useState(null);
@@ -90,6 +104,7 @@ export default function App() {
   const [tempProfile, setTempProfile] = useState(defaultProfile);
 
   const [glassesDrunk, setGlassesDrunk] = useState(0);
+  const [lastWaterTime, setLastWaterTime] = useState(0);
   const [todayMeals, setTodayMeals] = useState([]);
   const [aiCoachTip, setAiCoachTip] = useState("Scan your first meal to let Gemini analyze your daily nutrition targets!");
   const [isAnalyzingCoach, setIsAnalyzingCoach] = useState(false);
@@ -104,10 +119,22 @@ export default function App() {
   // Tickets: earned from real app usage. Meal = 10, water glass = 5,
   // first-ever login = 100 bonus. 3700 tickets = one free month subscription.
   const [tickets, setTickets] = useState(0);
+  const [nimGiftBalance, setNimGiftBalance] = useState(0);
   const TICKETS_PER_MEAL = 10;
   const TICKETS_PER_WATER = 5;
   const LOGIN_BONUS_TICKETS = 100;
   const TICKETS_FOR_FREE_MONTH = 3700;
+
+  // Competitions: 4 separate pools. Weekly = Sat-Sun, Monthly = calendar month.
+  // Each user's earned tickets/NIM this period are tracked separately from
+  // their spendable balances above (weeklyTicketsEarned resets every period).
+  const [weeklyTicketsEarned, setWeeklyTicketsEarned] = useState(0);
+  const [monthlyTicketsEarned, setMonthlyTicketsEarned] = useState(0);
+  const [weeklyNimEntered, setWeeklyNimEntered] = useState(false);
+  const [monthlyNimEntered, setMonthlyNimEntered] = useState(false);
+  const NIM_COMPETITION_ENTRY = 1; // NIM taken from gift balance to join a NIM competition
+  const WEEKLY_WINNER_BONUS_PCT = 0.10;
+  const MONTHLY_WINNER_BONUS_PCT = 0.40;
 
   const nimiqRef = useRef(null);
   const [nimiqReady, setNimiqReady] = useState(false);
@@ -145,6 +172,32 @@ export default function App() {
             // nimiqAddress is intentionally NOT restored from Firestore here —
             // the wallet address is only ever set from a live listAccounts() call.
             setTickets(typeof data.tickets === "number" ? data.tickets : 0);
+            setNimGiftBalance(typeof data.nimGiftBalance === "number" ? data.nimGiftBalance : 0);
+
+            // Weekly competition: reset the earned counter if the stored
+            // period doesn't match the current Sat-Sun window.
+            const currentWeekKey = getWeekKey();
+            const storedWeekKey = data.weeklyPeriod;
+            if (storedWeekKey === currentWeekKey) {
+              setWeeklyTicketsEarned(data.weeklyTicketsEarned || 0);
+              setWeeklyNimEntered(!!data.weeklyNimEntered);
+            } else {
+              setWeeklyTicketsEarned(0);
+              setWeeklyNimEntered(false);
+              await setDoc(userRef, { weeklyPeriod: currentWeekKey, weeklyTicketsEarned: 0, weeklyNimEntered: false }, { merge: true });
+            }
+
+            // Monthly competition: same idea, reset on calendar month change.
+            const currentMonthKey = getMonthKey();
+            const storedMonthKey = data.monthlyPeriod;
+            if (storedMonthKey === currentMonthKey) {
+              setMonthlyTicketsEarned(data.monthlyTicketsEarned || 0);
+              setMonthlyNimEntered(!!data.monthlyNimEntered);
+            } else {
+              setMonthlyTicketsEarned(0);
+              setMonthlyNimEntered(false);
+              await setDoc(userRef, { monthlyPeriod: currentMonthKey, monthlyTicketsEarned: 0, monthlyNimEntered: false }, { merge: true });
+            }
           } else {
             // Brand-new account: grant the one-time login bonus.
             await setDoc(userRef, { profile: defaultProfile, proUntil: 0, tickets: LOGIN_BONUS_TICKETS });
@@ -279,6 +332,9 @@ export default function App() {
   };
 
   const awardTickets = async (amount) => {
+    const weekKey = getWeekKey();
+    const monthKey = getMonthKey();
+
     setTickets((prev) => {
       const next = prev + amount;
       if (user) {
@@ -288,12 +344,86 @@ export default function App() {
       }
       return next;
     });
+
+    setWeeklyTicketsEarned((prev) => {
+      const next = prev + amount;
+      if (user) {
+        setDoc(doc(db, "users", user.uid), { weeklyTicketsEarned: next, weeklyPeriod: weekKey }, { merge: true }).catch(console.error);
+        setDoc(doc(db, "competitions_weekly_tickets", weekKey, "entries", user.uid), {
+          ticketsEarned: next,
+          displayName: user.email || user.displayName || "Anonymous",
+          updatedAt: Date.now(),
+        }, { merge: true }).catch(console.error);
+      }
+      return next;
+    });
+
+    setMonthlyTicketsEarned((prev) => {
+      const next = prev + amount;
+      if (user) {
+        setDoc(doc(db, "users", user.uid), { monthlyTicketsEarned: next, monthlyPeriod: monthKey }, { merge: true }).catch(console.error);
+        setDoc(doc(db, "competitions_monthly_tickets", monthKey, "entries", user.uid), {
+          ticketsEarned: next,
+          displayName: user.email || user.displayName || "Anonymous",
+          updatedAt: Date.now(),
+        }, { merge: true }).catch(console.error);
+      }
+      return next;
+    });
   };
 
-  const setWaterTo = (n) => {
-    const wasBelow = n > glassesDrunk;
-    setGlassesDrunk(Math.max(0, n));
-    if (wasBelow) awardTickets(TICKETS_PER_WATER);
+  const handleJoinWeeklyNimCompetition = async () => {
+    if (nimGiftBalance < NIM_COMPETITION_ENTRY || weeklyNimEntered) return;
+    const newBalance = nimGiftBalance - NIM_COMPETITION_ENTRY;
+    setNimGiftBalance(newBalance);
+    setWeeklyNimEntered(true);
+    if (user) {
+      const weekKey = getWeekKey();
+      await setDoc(doc(db, "users", user.uid), { nimGiftBalance: newBalance, weeklyNimEntered: true, weeklyPeriod: weekKey }, { merge: true });
+      await setDoc(doc(db, "competitions_weekly_nim", weekKey, "entries", user.uid), {
+        stake: NIM_COMPETITION_ENTRY,
+        ticketsEarned: weeklyTicketsEarned,
+        displayName: user.email || "Anonymous",
+        updatedAt: Date.now(),
+      }, { merge: true });
+    }
+  };
+
+  const handleJoinMonthlyNimCompetition = async () => {
+    if (nimGiftBalance < NIM_COMPETITION_ENTRY || monthlyNimEntered) return;
+    const newBalance = nimGiftBalance - NIM_COMPETITION_ENTRY;
+    setNimGiftBalance(newBalance);
+    setMonthlyNimEntered(true);
+    if (user) {
+      const monthKey = getMonthKey();
+      await setDoc(doc(db, "users", user.uid), { nimGiftBalance: newBalance, monthlyNimEntered: true, monthlyPeriod: monthKey }, { merge: true });
+      await setDoc(doc(db, "competitions_monthly_nim", monthKey, "entries", user.uid), {
+        stake: NIM_COMPETITION_ENTRY,
+        ticketsEarned: monthlyTicketsEarned,
+        displayName: user.email || "Anonymous",
+        updatedAt: Date.now(),
+      }, { merge: true });
+    }
+  };
+
+  const WAKING_HOURS = 16; // assumed awake window used to pace water reminders
+  const getWaterIntervalMs = () => (WAKING_HOURS * 60 * 60 * 1000) / waterGoalGlasses;
+
+  const handleAddWaterGlass = () => {
+    const now = Date.now();
+    const intervalMs = getWaterIntervalMs();
+    if (now - lastWaterTime < intervalMs) {
+      const minutesLeft = Math.ceil((intervalMs - (now - lastWaterTime)) / 60000);
+      alert(`Pace yourself! Next glass unlocks in ${minutesLeft} min. Drinking too fast doesn't count toward tickets.`);
+      return;
+    }
+    setGlassesDrunk((g) => g + 1);
+    setLastWaterTime(now);
+    awardTickets(TICKETS_PER_WATER);
+  };
+
+  const handleRemoveWaterGlass = () => {
+    setGlassesDrunk((g) => Math.max(0, g - 1));
   };
 
   const caloriesCurrent = todayMeals.reduce((sum, m) => sum + (Number(m.calories) || 0), 0);
@@ -528,6 +658,12 @@ export default function App() {
             <button style={styles.iconButton} onClick={() => setIsEditingProfile(true)} title="Profile & goals" aria-label="Profile & goals">
               <IconSettings size={15} />
             </button>
+            <span style={styles.iconButtonActive} title={`${tickets} tickets`}>
+              🎟️ {tickets}
+            </span>
+            <span style={styles.iconButtonActive} title={`${nimGiftBalance.toFixed(2)} NIM competition balance`}>
+              <IconWallet size={13} color="#8A6C0B" /> {nimGiftBalance.toFixed(1)}
+            </span>
             {!nimiqWalletAddress ? (
               <button style={styles.iconButton} onClick={handleNimiqConnect} title="Connect Nimiq wallet" aria-label="Connect Nimiq wallet">
                 <IconWallet size={15} />
@@ -636,6 +772,70 @@ export default function App() {
             <p style={{ fontSize: "11px", color: "#6B6656", marginTop: "6px" }}>
               +{TICKETS_PER_MEAL} per meal scanned · +{TICKETS_PER_WATER} per glass of water
             </p>
+          </div>
+        </div>
+
+        <div style={styles.ticket}>
+          <div style={styles.ticketPad}>
+            <div style={{ ...styles.eyebrow, marginBottom: "14px" }}>Competitions</div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${line}` }}>
+              <div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Touch Grass (Weekly · Tickets)</div>
+                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Sat–Sun · winner gets +{WEEKLY_WINNER_BONUS_PCT * 100}%</div>
+              </div>
+              <div style={{ fontFamily: "'Fraunces', serif", fontSize: "16px", fontWeight: 700, color: gold }}>{weeklyTicketsEarned}</div>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${line}` }}>
+              <div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Monthly Challenge (Tickets)</div>
+                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Calendar month · winner gets +{MONTHLY_WINNER_BONUS_PCT * 100}%</div>
+              </div>
+              <div style={{ fontFamily: "'Fraunces', serif", fontSize: "16px", fontWeight: 700, color: gold }}>{monthlyTicketsEarned}</div>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${line}` }}>
+              <div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Touch Grass (Weekly · NIM)</div>
+                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Entry: {NIM_COMPETITION_ENTRY} NIM from gift balance</div>
+              </div>
+              {weeklyNimEntered ? (
+                <span style={{ fontSize: "10.5px", color: moss, fontFamily: "'IBM Plex Mono', monospace" }}>Joined ✓</span>
+              ) : (
+                <button
+                  style={{ ...styles.ghostButton, width: "auto", marginTop: 0, padding: "6px 12px", fontSize: "10px" }}
+                  disabled={nimGiftBalance < NIM_COMPETITION_ENTRY}
+                  onClick={handleJoinWeeklyNimCompetition}
+                >
+                  Join
+                </button>
+              )}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0" }}>
+              <div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontSize: "13.5px", fontWeight: 600, color: ink }}>Monthly Challenge (NIM)</div>
+                <div style={{ fontSize: "10.5px", color: "#9A9484", fontFamily: "'IBM Plex Mono', monospace" }}>Entry: {NIM_COMPETITION_ENTRY} NIM from gift balance</div>
+              </div>
+              {monthlyNimEntered ? (
+                <span style={{ fontSize: "10.5px", color: moss, fontFamily: "'IBM Plex Mono', monospace" }}>Joined ✓</span>
+              ) : (
+                <button
+                  style={{ ...styles.ghostButton, width: "auto", marginTop: 0, padding: "6px 12px", fontSize: "10px" }}
+                  disabled={nimGiftBalance < NIM_COMPETITION_ENTRY}
+                  onClick={handleJoinMonthlyNimCompetition}
+                >
+                  Join
+                </button>
+              )}
+            </div>
+
+            {nimGiftBalance < NIM_COMPETITION_ENTRY && (
+              <p style={{ fontSize: "10.5px", color: "#9A9484", marginTop: "8px" }}>
+                Subscribe via Nimiq Pay to earn gift balance and join NIM competitions.
+              </p>
+            )}
           </div>
         </div>
 
@@ -837,18 +1037,16 @@ export default function App() {
             </div>
             <div style={styles.waterGlassRow}>
               {Array.from({ length: Math.max(waterGoalGlasses, glassesDrunk) }).map((_, i) => (
-                <div
-                  key={i}
-                  style={styles.waterGlass(i < glassesDrunk)}
-                  onClick={() => setWaterTo(i < glassesDrunk ? i : i + 1)}
-                  role="button" tabIndex={0}
-                />
+                <div key={i} style={styles.waterGlass(i < glassesDrunk)} />
               ))}
             </div>
             <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
-              <button style={styles.waterStepButton} onClick={() => setWaterTo(glassesDrunk - 1)} aria-label="Remove glass"><IconMinus /></button>
-              <button style={styles.waterStepButton} onClick={() => setWaterTo(glassesDrunk + 1)} aria-label="Add glass"><IconPlus /></button>
+              <button style={styles.waterStepButton} onClick={handleRemoveWaterGlass} aria-label="Remove glass"><IconMinus /></button>
+              <button style={styles.waterStepButton} onClick={handleAddWaterGlass} aria-label="Add glass"><IconPlus /></button>
             </div>
+            <p style={{ fontSize: "10.5px", color: "#9A9484", marginTop: "8px", fontFamily: "'IBM Plex Mono', monospace" }}>
+              1 glass every ~{Math.round(getWaterIntervalMs() / 60000)} min to earn tickets
+            </p>
           </div>
         </div>
 
