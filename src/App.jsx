@@ -1,13 +1,27 @@
 import React, { useState, useRef, useEffect } from "react";
 import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, setDoc, collection, query, orderBy, limit, getDocs } from "firebase/firestore";
-import { auth, db, googleProvider } from "./lib/firebase";
+import { httpsCallable } from "firebase/functions";
+import { auth, db, googleProvider, functions } from "./lib/firebase";
 import RingProgress from "./components/RingProgress";
 import { init } from "@nimiq/mini-app-sdk";
 import {
   IconSettings, IconWallet, IconFlame, IconDrumstick, IconWheat, IconDroplet,
-  IconLock, IconCheck, IconLogout, IconGoogle, IconPlus, IconMinus,
+  IconLock, IconCheck, IconLogout, IconGoogle, IconPlus, IconMinus, IconGift,
 } from "./components/icons";
+
+/**
+ * SECURITY — IMPORTANT
+ * ----------------------------------------------------------------------
+ * Tickets, nimGiftBalance, proUntil, and the weekly/monthly counters are
+ * NEVER written directly by this file via setDoc() anymore. All
+ * money/points logic now goes through the Cloud Functions in
+ * functions/index.js (logMealScanned, logWaterGlass, joinCompetition,
+ * confirmNimiqPayment, redeemTicketsForFreeMonth).
+ * See firestore.rules: these fields are blocked at the rules level for
+ * the client, so even editing this JS file can no longer be used to cheat.
+ * ----------------------------------------------------------------------
+ */
 
 const FONTS = `
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -27,6 +41,13 @@ const FONTS = `
 
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-flash-latest";
+
+// Cloud Function callables (voir functions/index.js)
+const callLogMealScanned = httpsCallable(functions, "logMealScanned");
+const callLogWaterGlass = httpsCallable(functions, "logWaterGlass");
+const callJoinCompetition = httpsCallable(functions, "joinCompetition");
+const callConfirmNimiqPayment = httpsCallable(functions, "confirmNimiqPayment");
+const callRedeemTicketsForFreeMonth = httpsCallable(functions, "redeemTicketsForFreeMonth");
 
 function parseGrams(value) {
   const n = parseFloat(String(value).replace(/[^\d.]/g, ""));
@@ -74,7 +95,8 @@ function buildWeekStrip(caloriesCurrentToday) {
 }
 
 function getWeekKey(d = new Date()) {
-  // Competition week runs Saturday-Sunday. Find the most recent Saturday.
+  // Competition week: Saturday -> Sunday (weekend). We find the most
+  // recent Saturday.
   const day = d.getDay(); // 0=Sun, 6=Sat
   const daysSinceSat = (day + 1) % 7; // Sat->0, Sun->1, Mon->2, ...
   const sat = new Date(d);
@@ -112,14 +134,66 @@ function Leaderboard({ entries, valueKey, valueSuffix, currentUid, dark }) {
           <span style={{ display: "flex", alignItems: "center", gap: "6px", overflow: "hidden" }}>
             <span style={{ opacity: 0.8 }}>{i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`}</span>
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {entry.displayName === currentUid ? "You" : (entry.displayName || "Anonymous")}
+              {entry.uid === currentUid ? "You" : (entry.displayName || "Anonymous")}
             </span>
           </span>
           <span style={{ fontWeight: 700 }}>{entry[valueKey]}{valueSuffix}</span>
+          {entry.wonBonus ? (
+            <span style={{ marginLeft: "6px", fontSize: "10px", opacity: 0.85 }}>+{entry.wonBonus} 🎁</span>
+          ) : null}
         </div>
       ))}
     </div>
   );
+}
+
+function StakeInput({ value, onChange, onEnter, maxBalance, entered, color = "#1B2430", textColor = "#1B2430", disabled }) {
+  if (entered) {
+    return <div style={{ marginTop: "12px", textAlign: "center", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700 }}>✓ You're in — good luck!</div>;
+  }
+  const quickPick = (pct) => onChange(String(Math.max(1, Math.floor(maxBalance * pct))));
+  return (
+    <div style={{ marginTop: "12px" }}>
+      <div style={{ display: "flex", gap: "8px" }}>
+        <input
+          type="number" min="1" step="1" max={maxBalance} value={value}
+          onChange={(e) => onChange(e.target.value)}
+          style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "1px solid rgba(0,0,0,0.2)", background: "rgba(255,255,255,0.5)", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", color: textColor, boxSizing: "border-box" }}
+        />
+        <button
+          style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: color, color: "#F5F3EC", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", opacity: disabled ? 0.6 : 1 }}
+          disabled={disabled || !(parseFloat(value) > 0) || parseFloat(value) > maxBalance}
+          onClick={onEnter}
+        >
+          Enter
+        </button>
+      </div>
+      <div style={{ display: "flex", gap: "6px", marginTop: "6px" }}>
+        {[0.25, 0.5, 1].map((pct) => (
+          <button
+            key={pct}
+            onClick={() => quickPick(pct)}
+            style={{ flex: 1, border: "1px solid rgba(0,0,0,0.15)", borderRadius: "6px", padding: "5px", background: "transparent", fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", cursor: "pointer", color: textColor }}
+          >
+            {pct === 1 ? "MAX" : `${pct * 100}%`}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function computeWeightProgressPct(startWeight, currentWeight, goalWeight) {
+  if (startWeight == null || startWeight === goalWeight) return 0;
+  const total = Math.abs(goalWeight - startWeight);
+  const done = goalWeight > startWeight
+    ? Math.max(0, currentWeight - startWeight)
+    : Math.max(0, startWeight - currentWeight);
+  // % relative to each person's own goal: someone who needs to lose 2kg
+  // and has lost 1kg is at 50%, someone who only needs to lose 0.2kg and
+  // has done so is at 100% — everyone is compared to THEIR OWN goal, not
+  // raw kg.
+  return Math.round(Math.min(100, (done / total) * 100));
 }
 
 export default function App() {
@@ -145,46 +219,62 @@ export default function App() {
   const [aiCoachTip, setAiCoachTip] = useState("Scan your first meal to let Gemini analyze your daily nutrition targets!");
   const [isAnalyzingCoach, setIsAnalyzingCoach] = useState(false);
 
-  // Email/password auth as a fallback to Google sign-in, which can fail
-  // inside WebViews (e.g. Nimiq Pay) since popups are often blocked there.
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
-  const [authMode, setAuthMode] = useState("login"); // "login" | "signup"
+  const [authMode, setAuthMode] = useState("login");
   const [authError, setAuthError] = useState("");
 
-  // Tickets: earned from real app usage. Meal = 10, water glass = 5,
-  // first-ever login = 100 bonus. 3700 tickets = one free month subscription.
   const [tickets, setTickets] = useState(0);
   const [nimGiftBalance, setNimGiftBalance] = useState(0);
   const TICKETS_PER_MEAL = 10;
   const TICKETS_PER_WATER = 5;
-  const LOGIN_BONUS_TICKETS = 100;
   const TICKETS_FOR_FREE_MONTH = 3700;
+  const [isRedeeming, setIsRedeeming] = useState(false);
 
-  // Competitions: 4 separate pools. Weekly = Sat-Sun, Monthly = calendar month.
-  // Each user's earned tickets/NIM this period are tracked separately from
-  // their spendable balances above (weeklyTicketsEarned resets every period).
   const [weeklyTicketsEarned, setWeeklyTicketsEarned] = useState(0);
   const [monthlyTicketsEarned, setMonthlyTicketsEarned] = useState(0);
   const [weeklyNimEntered, setWeeklyNimEntered] = useState(false);
   const [monthlyNimEntered, setMonthlyNimEntered] = useState(false);
-  const NIM_COMPETITION_ENTRY = 1; // default suggested stake, user can enter more
+  const NIM_COMPETITION_ENTRY = 1;
   const WEEKLY_WINNER_BONUS_PCT = 0.10;
   const MONTHLY_WINNER_BONUS_PCT = 0.40;
 
-  // Leaderboards: top entries per competition, fetched on demand from Firestore.
-  const [weeklyTicketsLeaderboard, setWeeklyTicketsLeaderboard] = useState([]);
-  const [monthlyTicketsLeaderboard, setMonthlyTicketsLeaderboard] = useState([]);
   const [weeklyNimLeaderboard, setWeeklyNimLeaderboard] = useState([]);
   const [monthlyNimLeaderboard, setMonthlyNimLeaderboard] = useState([]);
   const [leaderboardsLoading, setLeaderboardsLoading] = useState(false);
 
-  // User-chosen stake amounts for the two NIM competitions (defaults to the
-  // suggested entry above, but the person can enter any amount they want).
   const [weeklyNimStakeInput, setWeeklyNimStakeInput] = useState(String(NIM_COMPETITION_ENTRY));
   const [monthlyNimStakeInput, setMonthlyNimStakeInput] = useState(String(NIM_COMPETITION_ENTRY));
 
-  const [currentPage, setCurrentPage] = useState("home"); // "home" | "competitions" | "profile"
+  // Water Tracker & Weight Goal competitions — same stake mechanic as tickets/NIM
+  const [weeklyWaterGlassesEarned, setWeeklyWaterGlassesEarned] = useState(0);
+  const [monthlyWaterGlassesEarned, setMonthlyWaterGlassesEarned] = useState(0);
+  const [weeklyWeightStart, setWeeklyWeightStart] = useState(null);
+  const [monthlyWeightStart, setMonthlyWeightStart] = useState(null);
+
+  const [weeklyTicketStakeInput, setWeeklyTicketStakeInput] = useState("10");
+  const [monthlyTicketStakeInput, setMonthlyTicketStakeInput] = useState("10");
+  const [weeklyWaterStakeInput, setWeeklyWaterStakeInput] = useState("10");
+  const [monthlyWaterStakeInput, setMonthlyWaterStakeInput] = useState("10");
+  const [weeklyWeightStakeInput, setWeeklyWeightStakeInput] = useState("10");
+  const [monthlyWeightStakeInput, setMonthlyWeightStakeInput] = useState("10");
+
+  const [weeklyTicketEntered, setWeeklyTicketEntered] = useState(false);
+  const [monthlyTicketEntered, setMonthlyTicketEntered] = useState(false);
+  const [weeklyWaterEntered, setWeeklyWaterEntered] = useState(false);
+  const [monthlyWaterEntered, setMonthlyWaterEntered] = useState(false);
+  const [weeklyWeightEntered, setWeeklyWeightEntered] = useState(false);
+  const [monthlyWeightEntered, setMonthlyWeightEntered] = useState(false);
+  const [joiningCompetition, setJoiningCompetition] = useState(null); // type string en cours
+
+  const [weeklyTicketLeaderboard, setWeeklyTicketLeaderboard] = useState([]);
+  const [monthlyTicketLeaderboard, setMonthlyTicketLeaderboard] = useState([]);
+  const [weeklyWaterLeaderboard, setWeeklyWaterLeaderboard] = useState([]);
+  const [monthlyWaterLeaderboard, setMonthlyWaterLeaderboard] = useState([]);
+  const [weeklyWeightLeaderboard, setWeeklyWeightLeaderboard] = useState([]);
+  const [monthlyWeightLeaderboard, setMonthlyWeightLeaderboard] = useState([]);
+
+  const [currentPage, setCurrentPage] = useState("home");
   const [countdownTick, setCountdownTick] = useState(Date.now());
 
   useEffect(() => {
@@ -193,10 +283,8 @@ export default function App() {
   }, []);
 
   function getWeeklyCountdown() {
-    // Must match getWeekKey's Saturday-based reset, or the timer shown here
-    // will disagree with when tickets/NIM entries actually reset.
     const now = new Date(countdownTick);
-    const day = now.getDay(); // 0=Sun, 6=Sat
+    const day = now.getDay();
     const daysUntilSat = (6 - day + 7) % 7 || 7;
     const nextSaturday = new Date(now);
     nextSaturday.setDate(now.getDate() + daysUntilSat);
@@ -252,39 +340,46 @@ export default function App() {
               setTempProfile(data.profile);
             }
             if (data.proUntil && data.proUntil > Date.now()) setIsPro(true);
-            // nimiqAddress is intentionally NOT restored from Firestore here —
-            // the wallet address is only ever set from a live listAccounts() call.
+            // tickets / nimGiftBalance / weekly-monthly counters are
+            // READ-ONLY here: they are written only by the Cloud
+            // Functions (see firestore.rules).
             setTickets(typeof data.tickets === "number" ? data.tickets : 0);
             setNimGiftBalance(typeof data.nimGiftBalance === "number" ? data.nimGiftBalance : 0);
+            setLastWaterTime(typeof data.lastWaterTime === "number" ? data.lastWaterTime : 0);
 
-            // Weekly competition: reset the earned counter if the stored
-            // period doesn't match the current Sat-Sun window.
             const currentWeekKey = getWeekKey();
-            const storedWeekKey = data.weeklyPeriod;
-            if (storedWeekKey === currentWeekKey) {
+            if (data.weeklyPeriod === currentWeekKey) {
               setWeeklyTicketsEarned(data.weeklyTicketsEarned || 0);
               setWeeklyNimEntered(!!data.weeklyNimEntered);
+              setWeeklyWaterGlassesEarned(data.weeklyWaterGlassesEarned || 0);
+              setWeeklyWeightStart(typeof data.weeklyWeightStart === "number" ? data.weeklyWeightStart : null);
             } else {
+              // Period rotation (reset to zero) is handled by the Cloud
+              // Function on the next call — here we just display 0 in
+              // the meantime, without ever writing to Firestore ourselves.
               setWeeklyTicketsEarned(0);
               setWeeklyNimEntered(false);
-              await setDoc(userRef, { weeklyPeriod: currentWeekKey, weeklyTicketsEarned: 0, weeklyNimEntered: false }, { merge: true });
+              setWeeklyWaterGlassesEarned(0);
+              setWeeklyWeightStart(null);
             }
 
-            // Monthly competition: same idea, reset on calendar month change.
             const currentMonthKey = getMonthKey();
-            const storedMonthKey = data.monthlyPeriod;
-            if (storedMonthKey === currentMonthKey) {
+            if (data.monthlyPeriod === currentMonthKey) {
               setMonthlyTicketsEarned(data.monthlyTicketsEarned || 0);
               setMonthlyNimEntered(!!data.monthlyNimEntered);
+              setMonthlyWaterGlassesEarned(data.monthlyWaterGlassesEarned || 0);
+              setMonthlyWeightStart(typeof data.monthlyWeightStart === "number" ? data.monthlyWeightStart : null);
             } else {
               setMonthlyTicketsEarned(0);
               setMonthlyNimEntered(false);
-              await setDoc(userRef, { monthlyPeriod: currentMonthKey, monthlyTicketsEarned: 0, monthlyNimEntered: false }, { merge: true });
+              setMonthlyWaterGlassesEarned(0);
+              setMonthlyWeightStart(null);
             }
           } else {
-            // Brand-new account: grant the one-time login bonus.
-            await setDoc(userRef, { profile: defaultProfile, proUntil: 0, tickets: LOGIN_BONUS_TICKETS });
-            setTickets(LOGIN_BONUS_TICKETS);
+            // The starting balance is set server-side (add an
+            // onUserCreated trigger in functions/index.js if needed);
+            // here we only write the profile, never tickets/balances.
+            await setDoc(userRef, { profile: defaultProfile });
           }
         } catch (e) {
           console.error(e);
@@ -343,6 +438,8 @@ export default function App() {
     setIsEditingProfile(false);
     if (user) {
       try {
+        // "profile" remains freely editable by the client (weight,
+        // age...) — it is not a server-authoritative field.
         await setDoc(doc(db, "users", user.uid), { profile: tempProfile }, { merge: true });
       } catch (err) {
         console.error(err);
@@ -351,8 +448,9 @@ export default function App() {
   };
 
   const NIMIQ_APP_RECEIVING_ADDRESS = "NQ78 SF1K A42M CPT7 0LDP YT52 A747 8DB6 PX7P";
-  const PRO_PRICE_NIM = 50;
+  const PRO_PRICE_NIM = 100; // 100 NIM / month subscription
   const LUNAS_PER_NIM = 1e5;
+  const NIM_GIFT_BACK_PCT = 0.10; // 10% of the 100 NIM subscription (10 NIM) -> NIM competition gift balance. Locked: cannot be withdrawn, only used to enter NIM competitions.
 
   const handleNimiqConnect = async () => {
     const nimiq = nimiqRef.current;
@@ -376,13 +474,17 @@ export default function App() {
   };
 
   const handleRedeemTicketsForMonth = async () => {
-    if (tickets < TICKETS_FOR_FREE_MONTH) return;
-    const remaining = tickets - TICKETS_FOR_FREE_MONTH;
-    const expiry = Date.now() + 30 * 24 * 60 * 60 * 1000;
-    setTickets(remaining);
-    setIsPro(true);
-    if (user) {
-      await setDoc(doc(db, "users", user.uid), { tickets: remaining, proUntil: expiry }, { merge: true });
+    if (tickets < TICKETS_FOR_FREE_MONTH || isRedeeming) return;
+    setIsRedeeming(true);
+    try {
+      const result = await callRedeemTicketsForFreeMonth();
+      setTickets(result.data.tickets);
+      setIsPro(true);
+    } catch (err) {
+      console.error(err);
+      alert(err?.message || "Unable to redeem your tickets right now.");
+    } finally {
+      setIsRedeeming(false);
     }
   };
 
@@ -400,11 +502,12 @@ export default function App() {
         recipient: NIMIQ_APP_RECEIVING_ADDRESS,
         value: PRO_PRICE_NIM * LUNAS_PER_NIM,
       });
-      const expiry = Date.now() + 30 * 24 * 60 * 60 * 1000;
+      // The Pro credit + the 10 NIM gift-back are granted server-side
+      // ONLY after verifying the txHash (see confirmNimiqPayment in
+      // functions/index.js) — never locally.
+      const result = await callConfirmNimiqPayment({ txHash });
       setIsPro(true);
-      if (user) {
-        await setDoc(doc(db, "users", user.uid), { proUntil: expiry, lastPaymentTxHash: txHash }, { merge: true });
-      }
+      setNimGiftBalance((prev) => prev + (result.data.giftBack || 0));
     } catch (err) {
       console.error(err);
       if (err?.name === "PermissionDeniedError") {
@@ -414,64 +517,89 @@ export default function App() {
     }
   };
 
-  const awardTickets = async (amount) => {
-    const weekKey = getWeekKey();
-    const monthKey = getMonthKey();
+  // ---- Competitions: a single entry point that calls the
+  // joinCompetition Cloud Function. The displayed balance is only
+  // updated after the server's response (source of truth).
+  const joinCompetition = async ({ type, stakeInput, setEntered, currency, metricValue, extraFields }) => {
+    const stake = parseFloat(stakeInput);
+    const balance = currency === "nim" ? nimGiftBalance : tickets;
+    if (!Number.isFinite(stake) || stake <= 0 || stake > balance) return;
+    setJoiningCompetition(type);
+    try {
+      const result = await callJoinCompetition({ type, stake, metric: metricValue, extraFields });
+      if (currency === "nim") setNimGiftBalance(result.data.newBalance);
+      else setTickets(result.data.newBalance);
+      setEntered(true);
+      fetchLeaderboards();
+    } catch (err) {
+      console.error(err);
+      alert(err?.message || "Impossible de rejoindre cette compétition.");
+    } finally {
+      setJoiningCompetition(null);
+    }
+  };
 
-    setTickets((prev) => {
-      const next = prev + amount;
-      if (user) {
-        setDoc(doc(db, "users", user.uid), { tickets: next }, { merge: true }).catch((err) =>
-          console.error("Failed to save tickets:", err)
-        );
-      }
-      return next;
-    });
-
-    setWeeklyTicketsEarned((prev) => {
-      const next = prev + amount;
-      if (user) {
-        setDoc(doc(db, "users", user.uid), { weeklyTicketsEarned: next, weeklyPeriod: weekKey }, { merge: true }).catch(console.error);
-        setDoc(doc(db, "competitions_weekly_tickets", weekKey, "entries", user.uid), {
-          ticketsEarned: next,
-          displayName: user.email || user.displayName || "Anonymous",
-          updatedAt: Date.now(),
-        }, { merge: true }).catch(console.error);
-      }
-      return next;
-    });
-
-    setMonthlyTicketsEarned((prev) => {
-      const next = prev + amount;
-      if (user) {
-        setDoc(doc(db, "users", user.uid), { monthlyTicketsEarned: next, monthlyPeriod: monthKey }, { merge: true }).catch(console.error);
-        setDoc(doc(db, "competitions_monthly_tickets", monthKey, "entries", user.uid), {
-          ticketsEarned: next,
-          displayName: user.email || user.displayName || "Anonymous",
-          updatedAt: Date.now(),
-        }, { merge: true }).catch(console.error);
-      }
-      return next;
+  const handleJoinWeeklyTicketCompetition = () => joinCompetition({
+    type: "tickets_weekly", stakeInput: weeklyTicketStakeInput, currency: "tickets",
+    setEntered: setWeeklyTicketEntered, metricValue: weeklyTicketsEarned,
+  });
+  const handleJoinMonthlyTicketCompetition = () => joinCompetition({
+    type: "tickets_monthly", stakeInput: monthlyTicketStakeInput, currency: "tickets",
+    setEntered: setMonthlyTicketEntered, metricValue: monthlyTicketsEarned,
+  });
+  const handleJoinWeeklyWaterCompetition = () => joinCompetition({
+    type: "water_weekly", stakeInput: weeklyWaterStakeInput, currency: "tickets",
+    setEntered: setWeeklyWaterEntered, metricValue: weeklyWaterGlassesEarned,
+  });
+  const handleJoinMonthlyWaterCompetition = () => joinCompetition({
+    type: "water_monthly", stakeInput: monthlyWaterStakeInput, currency: "tickets",
+    setEntered: setMonthlyWaterEntered, metricValue: monthlyWaterGlassesEarned,
+  });
+  const handleJoinWeeklyWeightCompetition = () => {
+    const start = weeklyWeightStart ?? profile.weightKg;
+    if (weeklyWeightStart == null) setWeeklyWeightStart(start);
+    const pct = computeWeightProgressPct(start, profile.weightKg, profile.goalWeightKg);
+    joinCompetition({
+      type: "weight_weekly", stakeInput: weeklyWeightStakeInput, currency: "tickets",
+      setEntered: setWeeklyWeightEntered, metricValue: pct, extraFields: { startWeight: start },
     });
   };
+  const handleJoinMonthlyWeightCompetition = () => {
+    const start = monthlyWeightStart ?? profile.weightKg;
+    if (monthlyWeightStart == null) setMonthlyWeightStart(start);
+    const pct = computeWeightProgressPct(start, profile.weightKg, profile.goalWeightKg);
+    joinCompetition({
+      type: "weight_monthly", stakeInput: monthlyWeightStakeInput, currency: "tickets",
+      setEntered: setMonthlyWeightEntered, metricValue: pct, extraFields: { startWeight: start },
+    });
+  };
+  const handleJoinWeeklyNimCompetition = () => joinCompetition({
+    type: "nim_weekly", stakeInput: weeklyNimStakeInput, currency: "nim",
+    setEntered: setWeeklyNimEntered, metricValue: parseFloat(weeklyNimStakeInput),
+  });
+  const handleJoinMonthlyNimCompetition = () => joinCompetition({
+    type: "nim_monthly", stakeInput: monthlyNimStakeInput, currency: "nim",
+    setEntered: setMonthlyNimEntered, metricValue: parseFloat(monthlyNimStakeInput),
+  });
 
   const fetchLeaderboards = async () => {
     setLeaderboardsLoading(true);
     try {
       const weekKey = getWeekKey();
       const monthKey = getMonthKey();
+      const load = (col, key) => getDocs(query(collection(db, col, key, "entries"), orderBy("metric", "desc"), limit(10))).then((s) => s.docs.map((d) => d.data()));
 
-      const [wTickets, mTickets, wNim, mNim] = await Promise.all([
-        getDocs(query(collection(db, "competitions_weekly_tickets", weekKey, "entries"), orderBy("ticketsEarned", "desc"), limit(10))),
-        getDocs(query(collection(db, "competitions_monthly_tickets", monthKey, "entries"), orderBy("ticketsEarned", "desc"), limit(10))),
-        getDocs(query(collection(db, "competitions_weekly_nim", weekKey, "entries"), orderBy("stake", "desc"), limit(10))),
-        getDocs(query(collection(db, "competitions_monthly_nim", monthKey, "entries"), orderBy("stake", "desc"), limit(10))),
+      const [wTix, mTix, wWater, mWater, wWeight, mWeight, wNim, mNim] = await Promise.all([
+        load("competitions_weekly_tickets_stake", weekKey), load("competitions_monthly_tickets_stake", monthKey),
+        load("competitions_weekly_water", weekKey), load("competitions_monthly_water", monthKey),
+        load("competitions_weekly_weight", weekKey), load("competitions_monthly_weight", monthKey),
+        load("competitions_weekly_nim", weekKey), load("competitions_monthly_nim", monthKey),
       ]);
 
-      setWeeklyTicketsLeaderboard(wTickets.docs.map((d) => d.data()));
-      setMonthlyTicketsLeaderboard(mTickets.docs.map((d) => d.data()));
-      setWeeklyNimLeaderboard(wNim.docs.map((d) => d.data()));
-      setMonthlyNimLeaderboard(mNim.docs.map((d) => d.data()));
+      setWeeklyTicketLeaderboard(wTix); setMonthlyTicketLeaderboard(mTix);
+      setWeeklyWaterLeaderboard(wWater); setMonthlyWaterLeaderboard(mWater);
+      setWeeklyWeightLeaderboard(wWeight); setMonthlyWeightLeaderboard(mWeight);
+      setWeeklyNimLeaderboard(wNim); setMonthlyNimLeaderboard(mNim);
     } catch (err) {
       console.error("Failed to load leaderboards:", err);
     } finally {
@@ -484,50 +612,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPage]);
 
-  const handleJoinWeeklyNimCompetition = async () => {
-    const stake = parseFloat(weeklyNimStakeInput);
-    if (!Number.isFinite(stake) || stake <= 0 || stake > nimGiftBalance || weeklyNimEntered) return;
-    const newBalance = nimGiftBalance - stake;
-    setNimGiftBalance(newBalance);
-    setWeeklyNimEntered(true);
-    if (user) {
-      const weekKey = getWeekKey();
-      await setDoc(doc(db, "users", user.uid), { nimGiftBalance: newBalance, weeklyNimEntered: true, weeklyPeriod: weekKey }, { merge: true });
-      await setDoc(doc(db, "competitions_weekly_nim", weekKey, "entries", user.uid), {
-        stake,
-        ticketsEarned: weeklyTicketsEarned,
-        displayName: user.email || "Anonymous",
-        updatedAt: Date.now(),
-      }, { merge: true });
-      fetchLeaderboards();
-    }
-  };
-
-  const handleJoinMonthlyNimCompetition = async () => {
-    const stake = parseFloat(monthlyNimStakeInput);
-    if (!Number.isFinite(stake) || stake <= 0 || stake > nimGiftBalance || monthlyNimEntered) return;
-    const newBalance = nimGiftBalance - stake;
-    setNimGiftBalance(newBalance);
-    setMonthlyNimEntered(true);
-    if (user) {
-      const monthKey = getMonthKey();
-      await setDoc(doc(db, "users", user.uid), { nimGiftBalance: newBalance, monthlyNimEntered: true, monthlyPeriod: monthKey }, { merge: true });
-      await setDoc(doc(db, "competitions_monthly_nim", monthKey, "entries", user.uid), {
-        stake,
-        ticketsEarned: monthlyTicketsEarned,
-        displayName: user.email || "Anonymous",
-        updatedAt: Date.now(),
-      }, { merge: true });
-      fetchLeaderboards();
-    }
-  };
-
-  const WAKING_HOURS = 16; // assumed awake window used to pace water reminders
+  const WAKING_HOURS = 16;
   const getWaterIntervalMs = () => (WAKING_HOURS * 60 * 60 * 1000) / waterGoalGlasses;
 
-  const handleAddWaterGlass = () => {
+  const handleAddWaterGlass = async () => {
     const now = Date.now();
     const intervalMs = getWaterIntervalMs();
+    // Pré-check local pour l'UX (feedback instantané) — la vraie règle
+    // anti-triche est appliquée côté serveur dans logWaterGlass.
     if (now - lastWaterTime < intervalMs) {
       const minutesLeft = Math.ceil((intervalMs - (now - lastWaterTime)) / 60000);
       alert(`Pace yourself! Next glass unlocks in ${minutesLeft} min. Drinking too fast doesn't count toward tickets.`);
@@ -535,7 +627,17 @@ export default function App() {
     }
     setGlassesDrunk((g) => g + 1);
     setLastWaterTime(now);
-    awardTickets(TICKETS_PER_WATER);
+    try {
+      const result = await callLogWaterGlass();
+      setTickets(result.data.tickets);
+      setWeeklyWaterGlassesEarned((g) => g + 1);
+      setMonthlyWaterGlassesEarned((g) => g + 1);
+    } catch (err) {
+      console.error(err);
+      // Le serveur a refusé (pacing/anti-triche) -> on annule le glass local.
+      setGlassesDrunk((g) => Math.max(0, g - 1));
+      alert(err?.message || "Ce verre ne compte pas encore pour les tickets.");
+    }
   };
 
   const handleRemoveWaterGlass = () => {
@@ -651,7 +753,18 @@ export default function App() {
         setMealData(newMeal);
         setTodayMeals(updatedMeals);
         setScanState("done");
-        awardTickets(TICKETS_PER_MEAL);
+
+        // Les tickets sont crédités par le serveur (anti-triche) : le
+        // client ne peut plus juste "se donner" +10 tickets en rejouant
+        // cette fonction depuis la console.
+        try {
+          const result = await callLogMealScanned();
+          setTickets(result.data.tickets);
+          setWeeklyTicketsEarned((v) => v + TICKETS_PER_MEAL);
+          setMonthlyTicketsEarned((v) => v + TICKETS_PER_MEAL);
+        } catch (ticketErr) {
+          console.error("Ticket award failed:", ticketErr);
+        }
 
         fetchAiCoachTip(updatedMeals);
       } catch (err) {
@@ -755,6 +868,9 @@ export default function App() {
     },
     inputStyle: { width: "100%", padding: "10px", margin: "6px 0 12px", background: "#F5F3EC", border: `1px solid ${line}`, borderRadius: "6px", fontFamily: "'Inter', sans-serif", fontSize: "13px", boxSizing: "border-box" },
     labelStyle: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "10.5px", color: "#6B6656", textTransform: "uppercase" },
+    sectionHeader: { display: "flex", alignItems: "center", gap: "8px", padding: "6px 4px 0", marginTop: "6px" },
+    sectionHeaderText: { fontFamily: "'Fraunces', serif", fontSize: "16px", fontWeight: 700, color: ink },
+    sectionHeaderLine: { flex: 1, height: "1px", background: line },
   };
 
   const macroRingData = [
@@ -855,15 +971,25 @@ export default function App() {
             ) : (
               <div>
                 <p style={{ ...styles.heroSubtitle, marginBottom: "12px", fontSize: "12px" }}>
-                  Upgrade to Pro via Nimiq Pay (50 NIM / month) for weekly analytics &amp; cloud sync.
+                  Upgrade to Pro via Nimiq Pay ({PRO_PRICE_NIM} NIM / month) for weekly analytics &amp; cloud sync.
+                  {Math.round(NIM_GIFT_BACK_PCT * 100)}% of every payment ({Math.round(PRO_PRICE_NIM * NIM_GIFT_BACK_PCT)} NIM) is added to your Nimiq competition gift balance.
                 </p>
                 <button style={styles.nimiqPayButton} onClick={handleNimiqCheckout}>
-                  <IconWallet size={14} /> Pay 50 NIM with Nimiq Pay
+                  <IconWallet size={14} /> Pay {PRO_PRICE_NIM} NIM with Nimiq Pay
                 </button>
                 {!nimiqReady && (
                   <p style={{ fontSize: "11px", color: "#9A9484", marginTop: "8px", fontFamily: "'IBM Plex Mono', monospace" }}>
                     Nimiq wallet not detected — open this app from inside Nimiq Pay to pay.
                   </p>
+                )}
+                {tickets >= TICKETS_FOR_FREE_MONTH && (
+                  <button
+                    style={{ ...styles.ghostButton, marginTop: "10px", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+                    onClick={handleRedeemTicketsForMonth}
+                    disabled={isRedeeming}
+                  >
+                    <IconGift size={13} /> {isRedeeming ? "Redeeming…" : `Redeem ${TICKETS_FOR_FREE_MONTH} tickets for a free month`}
+                  </button>
                 )}
               </div>
             )}
@@ -890,6 +1016,15 @@ export default function App() {
             <p style={{ fontSize: "11px", color: "#6B6656", marginTop: "6px" }}>
               +{TICKETS_PER_MEAL} per meal scanned · +{TICKETS_PER_WATER} per glass of water
             </p>
+            {isPro && tickets >= TICKETS_FOR_FREE_MONTH && (
+              <button
+                style={{ ...styles.ghostButton, marginTop: "10px", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+                onClick={handleRedeemTicketsForMonth}
+                disabled={isRedeeming}
+              >
+                <IconGift size={13} /> {isRedeeming ? "Redeeming…" : "Redeem for next month"}
+              </button>
+            )}
           </div>
         </div>
 
@@ -1104,43 +1239,144 @@ export default function App() {
               <p style={{ fontSize: "10.5px", color: "#9A9484", textAlign: "center", fontFamily: "'IBM Plex Mono', monospace" }}>Loading leaderboards…</p>
             )}
 
-            {/* Weekly Tickets */}
+            {/* ===================== CHALLENGES (staked with tickets) ===================== */}
+            <div style={styles.sectionHeader}>
+              <span style={styles.sectionHeaderText}>🎯 Challenges</span>
+              <span style={styles.sectionHeaderLine} />
+            </div>
+
+            {/* Weekly Tickets Stake */}
             <div style={{
               background: `linear-gradient(135deg, ${rust}, #8a3a20)`, borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(181,80,46,0.35)",
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                 <div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Touch Grass · Weekly · Free Entry</div>
-                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>{weeklyTicketsEarned} tickets</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Touch Grass · Weekly</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>Stake your tickets</div>
                 </div>
                 <div style={{ fontSize: "22px" }}>🎟️</div>
               </div>
               <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
                 ⏱ ends in {getWeeklyCountdown().label}
               </div>
-              <div style={{ fontSize: "11px", marginTop: "10px", opacity: 0.9 }}>Winner earns +{WEEKLY_WINNER_BONUS_PCT * 100}% bonus tickets. Automatically entered — just keep scanning meals and logging water.</div>
-              <Leaderboard entries={weeklyTicketsLeaderboard} valueKey="ticketsEarned" valueSuffix=" tickets" currentUid={user?.uid} />
+              <StakeInput value={weeklyTicketStakeInput} onChange={setWeeklyTicketStakeInput} onEnter={handleJoinWeeklyTicketCompetition} maxBalance={tickets} entered={weeklyTicketEntered} color="#1B2430" textColor="#F5F3EC" disabled={joiningCompetition === "tickets_weekly"} />
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Your balance: {tickets} tickets — enter any amount you like · Winner earns +{WEEKLY_WINNER_BONUS_PCT * 100}% bonus</p>
+              <Leaderboard entries={weeklyTicketLeaderboard} valueKey="stake" valueSuffix=" tickets" currentUid={user?.uid} dark />
             </div>
 
-            {/* Monthly Tickets */}
+            {/* Monthly Tickets Stake */}
             <div style={{
               background: `linear-gradient(135deg, ${gold}, #7a6234)`, borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(169,138,75,0.35)",
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                 <div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Monthly Challenge · Free Entry</div>
-                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>{monthlyTicketsEarned} tickets</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Monthly Challenge</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>Stake your tickets</div>
                 </div>
                 <div style={{ fontSize: "22px" }}>🏅</div>
               </div>
               <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
                 ⏱ ends in {getMonthlyCountdown().label}
               </div>
-              <div style={{ fontSize: "11px", marginTop: "10px", opacity: 0.9 }}>Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus tickets. Automatically entered.</div>
-              <Leaderboard entries={monthlyTicketsLeaderboard} valueKey="ticketsEarned" valueSuffix=" tickets" currentUid={user?.uid} />
+              <StakeInput value={monthlyTicketStakeInput} onChange={setMonthlyTicketStakeInput} onEnter={handleJoinMonthlyTicketCompetition} maxBalance={tickets} entered={monthlyTicketEntered} color="#1B2430" textColor="#F5F3EC" disabled={joiningCompetition === "tickets_monthly"} />
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Your balance: {tickets} tickets — enter any amount you like · Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus</p>
+              <Leaderboard entries={monthlyTicketLeaderboard} valueKey="stake" valueSuffix=" tickets" currentUid={user?.uid} dark />
             </div>
+
+            {/* Weekly Stay Hydrated */}
+            <div style={{
+              background: "linear-gradient(135deg, #3E7CB1, #234a68)", borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(62,124,177,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Stay Hydrated · Weekly</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>{weeklyWaterGlassesEarned} glasses</div>
+                </div>
+                <div style={{ fontSize: "22px" }}>💧</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getWeeklyCountdown().label}
+              </div>
+              <StakeInput value={weeklyWaterStakeInput} onChange={setWeeklyWaterStakeInput} onEnter={handleJoinWeeklyWaterCompetition} maxBalance={tickets} entered={weeklyWaterEntered} color="#F5F3EC" textColor="#F5F3EC" disabled={joiningCompetition === "water_weekly"} />
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Ranked by glasses logged this week · Winner earns +{WEEKLY_WINNER_BONUS_PCT * 100}% bonus</p>
+              <Leaderboard entries={weeklyWaterLeaderboard} valueKey="metric" valueSuffix=" glasses" currentUid={user?.uid} dark />
+            </div>
+
+            {/* Monthly Stay Hydrated */}
+            <div style={{
+              background: "linear-gradient(135deg, #2E5F8A, #16324a)", borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(46,95,138,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Stay Hydrated · Monthly</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>{monthlyWaterGlassesEarned} glasses</div>
+                </div>
+                <div style={{ fontSize: "22px" }}>🌊</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getMonthlyCountdown().label}
+              </div>
+              <StakeInput value={monthlyWaterStakeInput} onChange={setMonthlyWaterStakeInput} onEnter={handleJoinMonthlyWaterCompetition} maxBalance={tickets} entered={monthlyWaterEntered} color="#F5F3EC" textColor="#F5F3EC" disabled={joiningCompetition === "water_monthly"} />
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Ranked by glasses logged this month · Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus</p>
+              <Leaderboard entries={monthlyWaterLeaderboard} valueKey="metric" valueSuffix=" glasses" currentUid={user?.uid} dark />
+            </div>
+
+            {/* Weekly Weight Goal */}
+            <div style={{
+              background: "linear-gradient(135deg, #56705A, #2e3d30)", borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(86,112,90,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Weight Goal Sprint · Weekly</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>
+                    {computeWeightProgressPct(weeklyWeightStart ?? profile.weightKg, profile.weightKg, profile.goalWeightKg)}% progress
+                  </div>
+                </div>
+                <div style={{ fontSize: "22px" }}>⚖️</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getWeeklyCountdown().label}
+              </div>
+              <StakeInput value={weeklyWeightStakeInput} onChange={setWeeklyWeightStakeInput} onEnter={handleJoinWeeklyWeightCompetition} maxBalance={tickets} entered={weeklyWeightEntered} color="#F5F3EC" textColor="#F5F3EC" disabled={joiningCompetition === "weight_weekly"} />
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Ranked by % progress toward your own goal weight (not raw kg) · Winner earns +{WEEKLY_WINNER_BONUS_PCT * 100}% bonus</p>
+              <Leaderboard entries={weeklyWeightLeaderboard} valueKey="metric" valueSuffix="% progress" currentUid={user?.uid} dark />
+            </div>
+
+            {/* Monthly Weight Goal */}
+            <div style={{
+              background: "linear-gradient(135deg, #3a4d3d, #1c261d)", borderRadius: "14px", padding: "20px",
+              color: "#F5F3EC", boxShadow: "0 8px 20px rgba(58,77,61,0.35)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Weight Goal Sprint · Monthly</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>
+                    {computeWeightProgressPct(monthlyWeightStart ?? profile.weightKg, profile.weightKg, profile.goalWeightKg)}% progress
+                  </div>
+                </div>
+                <div style={{ fontSize: "22px" }}>👑</div>
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px", marginTop: "14px", background: "rgba(0,0,0,0.2)", borderRadius: "8px", padding: "8px 12px", textAlign: "center" }}>
+                ⏱ ends in {getMonthlyCountdown().label}
+              </div>
+              <StakeInput value={monthlyWeightStakeInput} onChange={setMonthlyWeightStakeInput} onEnter={handleJoinMonthlyWeightCompetition} maxBalance={tickets} entered={monthlyWeightEntered} color="#F5F3EC" textColor="#F5F3EC" disabled={joiningCompetition === "weight_monthly"} />
+              <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Ranked by % progress toward your own goal weight (not raw kg) · Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus</p>
+              <Leaderboard entries={monthlyWeightLeaderboard} valueKey="metric" valueSuffix="% progress" currentUid={user?.uid} dark />
+            </div>
+
+            {/* ===================== NIMIQ (staked with the NIM gift balance earned from Pro subscription) ===================== */}
+            <div style={styles.sectionHeader}>
+              <span style={{ ...styles.sectionHeaderText, color: "#8A6C0B" }}>🔶 Nimiq</span>
+              <span style={styles.sectionHeaderLine} />
+            </div>
+            <p style={{ fontSize: "10.5px", color: "#9A9484", padding: "0 4px", marginTop: "-6px" }}>
+              Funded by your Nimiq Pay subscription — {Math.round(PRO_PRICE_NIM * NIM_GIFT_BACK_PCT)} NIM/month, locked (competition entries only, cannot be withdrawn).
+            </p>
 
             {/* Weekly NIM */}
             <div style={{
@@ -1149,7 +1385,7 @@ export default function App() {
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                 <div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.75, textTransform: "uppercase" }}>Touch Grass · Weekly · NIM Stakes</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.75, textTransform: "uppercase" }}>Touch Grass · Weekly</div>
                   <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>Stake what you want</div>
                 </div>
                 <div style={{ fontSize: "22px" }}>💰</div>
@@ -1171,8 +1407,8 @@ export default function App() {
                     style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "1px solid rgba(27,36,48,0.25)", background: "rgba(255,255,255,0.5)", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", color: "#1B2430", boxSizing: "border-box" }}
                   />
                   <button
-                    style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: "#1B2430", color: "#F5F3EC", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
-                    disabled={!(parseFloat(weeklyNimStakeInput) > 0) || parseFloat(weeklyNimStakeInput) > nimGiftBalance}
+                    style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: "#1B2430", color: "#F5F3EC", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", opacity: joiningCompetition === "nim_weekly" ? 0.6 : 1 }}
+                    disabled={joiningCompetition === "nim_weekly" || !(parseFloat(weeklyNimStakeInput) > 0) || parseFloat(weeklyNimStakeInput) > nimGiftBalance}
                     onClick={handleJoinWeeklyNimCompetition}
                   >
                     Enter
@@ -1190,7 +1426,7 @@ export default function App() {
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                 <div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Monthly Challenge · NIM Stakes</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "10px", letterSpacing: "0.1em", opacity: 0.85, textTransform: "uppercase" }}>Monthly Challenge</div>
                   <div style={{ fontFamily: "'Fraunces', serif", fontSize: "22px", fontWeight: 700, marginTop: "4px" }}>Stake what you want</div>
                 </div>
                 <div style={{ fontSize: "22px" }}>👑</div>
@@ -1212,8 +1448,8 @@ export default function App() {
                     style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.3)", background: "rgba(255,255,255,0.12)", fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", color: "#F5F3EC", boxSizing: "border-box" }}
                   />
                   <button
-                    style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: "#F5F3EC", color: moss, fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
-                    disabled={!(parseFloat(monthlyNimStakeInput) > 0) || parseFloat(monthlyNimStakeInput) > nimGiftBalance}
+                    style={{ border: "none", borderRadius: "8px", padding: "10px 14px", background: "#F5F3EC", color: moss, fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", opacity: joiningCompetition === "nim_monthly" ? 0.6 : 1 }}
+                    disabled={joiningCompetition === "nim_monthly" || !(parseFloat(monthlyNimStakeInput) > 0) || parseFloat(monthlyNimStakeInput) > nimGiftBalance}
                     onClick={handleJoinMonthlyNimCompetition}
                   >
                     Enter
@@ -1224,9 +1460,6 @@ export default function App() {
               <Leaderboard entries={monthlyNimLeaderboard} valueKey="stake" valueSuffix=" NIM" currentUid={user?.uid} />
             </div>
 
-            <p style={{ fontSize: "11px", color: "#9A9484", textAlign: "center", padding: "0 10px" }}>
-              NIM gift balance: {nimGiftBalance.toFixed(2)} NIM — earned automatically from your Nimiq Pay subscription.
-            </p>
           </div>
         )}
 
