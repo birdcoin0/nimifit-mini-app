@@ -14,6 +14,11 @@ const firebaseConfig = {
 };
 
 const app = initializeApp(firebaseConfig);
+
+// Immediate Debug Steps (Kif ma ghaffat l-image)
+console.log("Firebase Config:", firebaseConfig);
+console.log("API Key length:", firebaseConfig.apiKey?.length);
+
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const googleProvider = new GoogleAuthProvider();
