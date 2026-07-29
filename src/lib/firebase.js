@@ -1,9 +1,10 @@
 import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDdVEt1xRoTX8q0V9wFlvdwts0xg6FjbEI",
+  apiKey: "AIzaSyDdVEt1xRoTX8q0V9wFlwdts0xg6FjbEI",
   authDomain: "nimifit.firebaseapp.com",
   projectId: "nimifit",
   storageBucket: "nimifit.appspot.com",
@@ -16,3 +17,4 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const googleProvider = new GoogleAuthProvider();
+export const functions = getFunctions(app);
