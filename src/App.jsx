@@ -5,6 +5,7 @@ import { httpsCallable } from "firebase/functions";
 import { auth, db, googleProvider, functions } from "./lib/firebase";
 import RingProgress from "./components/RingProgress";
 import { init } from "@nimiq/mini-app-sdk";
+import TouchGrass from "./TouchGrass";
 import {
   IconSettings, IconWallet, IconFlame, IconDrumstick, IconWheat, IconDroplet,
   IconLock, IconCheck, IconLogout, IconGoogle, IconPlus, IconMinus, IconGift,
@@ -95,10 +96,8 @@ function buildWeekStrip(caloriesCurrentToday) {
 }
 
 function getWeekKey(d = new Date()) {
-  // Competition week: Saturday -> Sunday (weekend). We find the most
-  // recent Saturday.
-  const day = d.getDay(); // 0=Sun, 6=Sat
-  const daysSinceSat = (day + 1) % 7; // Sat->0, Sun->1, Mon->2, ...
+  const day = d.getDay();
+  const daysSinceSat = (day + 1) % 7;
   const sat = new Date(d);
   sat.setDate(d.getDate() - daysSinceSat);
   return `${sat.getFullYear()}-${String(sat.getMonth() + 1).padStart(2, "0")}-${String(sat.getDate()).padStart(2, "0")}`;
@@ -189,10 +188,6 @@ function computeWeightProgressPct(startWeight, currentWeight, goalWeight) {
   const done = goalWeight > startWeight
     ? Math.max(0, currentWeight - startWeight)
     : Math.max(0, startWeight - currentWeight);
-  // % relative to each person's own goal: someone who needs to lose 2kg
-  // and has lost 1kg is at 50%, someone who only needs to lose 0.2kg and
-  // has done so is at 100% — everyone is compared to THEIR OWN goal, not
-  // raw kg.
   return Math.round(Math.min(100, (done / total) * 100));
 }
 
@@ -246,7 +241,6 @@ export default function App() {
   const [weeklyNimStakeInput, setWeeklyNimStakeInput] = useState(String(NIM_COMPETITION_ENTRY));
   const [monthlyNimStakeInput, setMonthlyNimStakeInput] = useState(String(NIM_COMPETITION_ENTRY));
 
-  // Water Tracker & Weight Goal competitions — same stake mechanic as tickets/NIM
   const [weeklyWaterGlassesEarned, setWeeklyWaterGlassesEarned] = useState(0);
   const [monthlyWaterGlassesEarned, setMonthlyWaterGlassesEarned] = useState(0);
   const [weeklyWeightStart, setWeeklyWeightStart] = useState(null);
@@ -265,7 +259,7 @@ export default function App() {
   const [monthlyWaterEntered, setMonthlyWaterEntered] = useState(false);
   const [weeklyWeightEntered, setWeeklyWeightEntered] = useState(false);
   const [monthlyWeightEntered, setMonthlyWeightEntered] = useState(false);
-  const [joiningCompetition, setJoiningCompetition] = useState(null); // type string en cours
+  const [joiningCompetition, setJoiningCompetition] = useState(null);
 
   const [weeklyTicketLeaderboard, setWeeklyTicketLeaderboard] = useState([]);
   const [monthlyTicketLeaderboard, setMonthlyTicketLeaderboard] = useState([]);
@@ -340,9 +334,6 @@ export default function App() {
               setTempProfile(data.profile);
             }
             if (data.proUntil && data.proUntil > Date.now()) setIsPro(true);
-            // tickets / nimGiftBalance / weekly-monthly counters are
-            // READ-ONLY here: they are written only by the Cloud
-            // Functions (see firestore.rules).
             setTickets(typeof data.tickets === "number" ? data.tickets : 0);
             setNimGiftBalance(typeof data.nimGiftBalance === "number" ? data.nimGiftBalance : 0);
             setLastWaterTime(typeof data.lastWaterTime === "number" ? data.lastWaterTime : 0);
@@ -354,9 +345,6 @@ export default function App() {
               setWeeklyWaterGlassesEarned(data.weeklyWaterGlassesEarned || 0);
               setWeeklyWeightStart(typeof data.weeklyWeightStart === "number" ? data.weeklyWeightStart : null);
             } else {
-              // Period rotation (reset to zero) is handled by the Cloud
-              // Function on the next call — here we just display 0 in
-              // the meantime, without ever writing to Firestore ourselves.
               setWeeklyTicketsEarned(0);
               setWeeklyNimEntered(false);
               setWeeklyWaterGlassesEarned(0);
@@ -376,9 +364,6 @@ export default function App() {
               setMonthlyWeightStart(null);
             }
           } else {
-            // The starting balance is set server-side (add an
-            // onUserCreated trigger in functions/index.js if needed);
-            // here we only write the profile, never tickets/balances.
             await setDoc(userRef, { profile: defaultProfile });
           }
         } catch (e) {
@@ -438,8 +423,6 @@ export default function App() {
     setIsEditingProfile(false);
     if (user) {
       try {
-        // "profile" remains freely editable by the client (weight,
-        // age...) — it is not a server-authoritative field.
         await setDoc(doc(db, "users", user.uid), { profile: tempProfile }, { merge: true });
       } catch (err) {
         console.error(err);
@@ -448,9 +431,9 @@ export default function App() {
   };
 
   const NIMIQ_APP_RECEIVING_ADDRESS = "NQ78 SF1K A42M CPT7 0LDP YT52 A747 8DB6 PX7P";
-  const PRO_PRICE_NIM = 100; // 100 NIM / month subscription
+  const PRO_PRICE_NIM = 100;
   const LUNAS_PER_NIM = 1e5;
-  const NIM_GIFT_BACK_PCT = 0.10; // 10% of the 100 NIM subscription (10 NIM) -> NIM competition gift balance. Locked: cannot be withdrawn, only used to enter NIM competitions.
+  const NIM_GIFT_BACK_PCT = 0.10;
 
   const handleNimiqConnect = async () => {
     const nimiq = nimiqRef.current;
@@ -502,9 +485,6 @@ export default function App() {
         recipient: NIMIQ_APP_RECEIVING_ADDRESS,
         value: PRO_PRICE_NIM * LUNAS_PER_NIM,
       });
-      // The Pro credit + the 10 NIM gift-back are granted server-side
-      // ONLY after verifying the txHash (see confirmNimiqPayment in
-      // functions/index.js) — never locally.
       const result = await callConfirmNimiqPayment({ txHash });
       setIsPro(true);
       setNimGiftBalance((prev) => prev + (result.data.giftBack || 0));
@@ -517,9 +497,6 @@ export default function App() {
     }
   };
 
-  // ---- Competitions: a single entry point that calls the
-  // joinCompetition Cloud Function. The displayed balance is only
-  // updated after the server's response (source of truth).
   const joinCompetition = async ({ type, stakeInput, setEntered, currency, metricValue, extraFields }) => {
     const stake = parseFloat(stakeInput);
     const balance = currency === "nim" ? nimGiftBalance : tickets;
@@ -609,7 +586,6 @@ export default function App() {
 
   useEffect(() => {
     if (currentPage === "competitions") fetchLeaderboards();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPage]);
 
   const WAKING_HOURS = 16;
@@ -618,8 +594,6 @@ export default function App() {
   const handleAddWaterGlass = async () => {
     const now = Date.now();
     const intervalMs = getWaterIntervalMs();
-    // Pré-check local pour l'UX (feedback instantané) — la vraie règle
-    // anti-triche est appliquée côté serveur dans logWaterGlass.
     if (now - lastWaterTime < intervalMs) {
       const minutesLeft = Math.ceil((intervalMs - (now - lastWaterTime)) / 60000);
       alert(`Pace yourself! Next glass unlocks in ${minutesLeft} min. Drinking too fast doesn't count toward tickets.`);
@@ -634,7 +608,6 @@ export default function App() {
       setMonthlyWaterGlassesEarned((g) => g + 1);
     } catch (err) {
       console.error(err);
-      // Le serveur a refusé (pacing/anti-triche) -> on annule le glass local.
       setGlassesDrunk((g) => Math.max(0, g - 1));
       alert(err?.message || "Ce verre ne compte pas encore pour les tickets.");
     }
@@ -754,9 +727,6 @@ export default function App() {
         setTodayMeals(updatedMeals);
         setScanState("done");
 
-        // Les tickets sont crédités par le serveur (anti-triche) : le
-        // client ne peut plus juste "se donner" +10 tickets en rejouant
-        // cette fonction depuis la console.
         try {
           const result = await callLogMealScanned();
           setTickets(result.data.tickets);
@@ -1014,7 +984,7 @@ export default function App() {
               {tickets} / {TICKETS_FOR_FREE_MONTH} — {Math.min(100, Math.round((tickets / TICKETS_FOR_FREE_MONTH) * 100))}% to a free month
             </p>
             <p style={{ fontSize: "11px", color: "#6B6656", marginTop: "6px" }}>
-              +{TICKETS_PER_MEAL} per meal scanned · +{TICKETS_PER_WATER} per glass of water
+              +{TICKETS_PER_MEAL} per meal scanned · +{TICKETS_PER_WATER} per glass of water · +50 per post
             </p>
             {isPro && tickets >= TICKETS_FOR_FREE_MONTH && (
               <button
@@ -1229,6 +1199,10 @@ export default function App() {
         </>
         )}
 
+        {currentPage === "touch-grass" && (
+          <TouchGrass user={user} styles={styles} ink={ink} rust={rust} line={line} gold={gold} paper={paper} moss={moss} />
+        )}
+
         {currentPage === "competitions" && (
           <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             <div style={{ padding: "0 4px 6px" }}>
@@ -1239,13 +1213,11 @@ export default function App() {
               <p style={{ fontSize: "10.5px", color: "#9A9484", textAlign: "center", fontFamily: "'IBM Plex Mono', monospace" }}>Loading leaderboards…</p>
             )}
 
-            {/* ===================== CHALLENGES (staked with tickets) ===================== */}
             <div style={styles.sectionHeader}>
               <span style={styles.sectionHeaderText}>🎯 Challenges</span>
               <span style={styles.sectionHeaderLine} />
             </div>
 
-            {/* Weekly Tickets Stake */}
             <div style={{
               background: `linear-gradient(135deg, ${rust}, #8a3a20)`, borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(181,80,46,0.35)",
@@ -1265,7 +1237,6 @@ export default function App() {
               <Leaderboard entries={weeklyTicketLeaderboard} valueKey="stake" valueSuffix=" tickets" currentUid={user?.uid} dark />
             </div>
 
-            {/* Monthly Tickets Stake */}
             <div style={{
               background: `linear-gradient(135deg, ${gold}, #7a6234)`, borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(169,138,75,0.35)",
@@ -1285,7 +1256,6 @@ export default function App() {
               <Leaderboard entries={monthlyTicketLeaderboard} valueKey="stake" valueSuffix=" tickets" currentUid={user?.uid} dark />
             </div>
 
-            {/* Weekly Stay Hydrated */}
             <div style={{
               background: "linear-gradient(135deg, #3E7CB1, #234a68)", borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(62,124,177,0.35)",
@@ -1305,7 +1275,6 @@ export default function App() {
               <Leaderboard entries={weeklyWaterLeaderboard} valueKey="metric" valueSuffix=" glasses" currentUid={user?.uid} dark />
             </div>
 
-            {/* Monthly Stay Hydrated */}
             <div style={{
               background: "linear-gradient(135deg, #2E5F8A, #16324a)", borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(46,95,138,0.35)",
@@ -1322,10 +1291,9 @@ export default function App() {
               </div>
               <StakeInput value={monthlyWaterStakeInput} onChange={setMonthlyWaterStakeInput} onEnter={handleJoinMonthlyWaterCompetition} maxBalance={tickets} entered={monthlyWaterEntered} color="#F5F3EC" textColor="#F5F3EC" disabled={joiningCompetition === "water_monthly"} />
               <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Ranked by glasses logged this month · Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus</p>
-              <Leaderboard entries={monthlyWaterLeaderboard} valueKey="metric" valueSuffix=" glasses" currentUid={user?.uid} dark />
+              <Leaderboard entries={monthlyWaterLeaderboard} valueKey="metric" valueSuffix=" glasses" currentUid={user?.uid} />
             </div>
 
-            {/* Weekly Weight Goal */}
             <div style={{
               background: "linear-gradient(135deg, #56705A, #2e3d30)", borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(86,112,90,0.35)",
@@ -1347,7 +1315,6 @@ export default function App() {
               <Leaderboard entries={weeklyWeightLeaderboard} valueKey="metric" valueSuffix="% progress" currentUid={user?.uid} dark />
             </div>
 
-            {/* Monthly Weight Goal */}
             <div style={{
               background: "linear-gradient(135deg, #3a4d3d, #1c261d)", borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(58,77,61,0.35)",
@@ -1366,10 +1333,9 @@ export default function App() {
               </div>
               <StakeInput value={monthlyWeightStakeInput} onChange={setMonthlyWeightStakeInput} onEnter={handleJoinMonthlyWeightCompetition} maxBalance={tickets} entered={monthlyWeightEntered} color="#F5F3EC" textColor="#F5F3EC" disabled={joiningCompetition === "weight_monthly"} />
               <p style={{ fontSize: "10px", marginTop: "6px", opacity: 0.85 }}>Ranked by % progress toward your own goal weight (not raw kg) · Winner earns +{MONTHLY_WINNER_BONUS_PCT * 100}% bonus</p>
-              <Leaderboard entries={monthlyWeightLeaderboard} valueKey="metric" valueSuffix="% progress" currentUid={user?.uid} dark />
+              <Leaderboard entries={monthlyWeightLeaderboard} valueKey="metric" valueSuffix="% progress" currentUid={user?.uid} />
             </div>
 
-            {/* ===================== NIMIQ (staked with the NIM gift balance earned from Pro subscription) ===================== */}
             <div style={styles.sectionHeader}>
               <span style={{ ...styles.sectionHeaderText, color: "#8A6C0B" }}>🔶 Nimiq</span>
               <span style={styles.sectionHeaderLine} />
@@ -1378,9 +1344,8 @@ export default function App() {
               Funded by your Nimiq Pay subscription — {Math.round(PRO_PRICE_NIM * NIM_GIFT_BACK_PCT)} NIM/month, locked (competition entries only, cannot be withdrawn).
             </p>
 
-            {/* Weekly NIM */}
             <div style={{
-              background: `linear-gradient(135deg, ${nimiqOrange}, #b8860f)`, borderRadius: "14px", padding: "20px",
+              background: `linear-gradient(135deg, ${gold}, #b8860f)`, borderRadius: "14px", padding: "20px",
               color: "#1B2430", boxShadow: "0 8px 20px rgba(233,178,19,0.35)",
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -1419,7 +1384,6 @@ export default function App() {
               <Leaderboard entries={weeklyNimLeaderboard} valueKey="stake" valueSuffix=" NIM" currentUid={user?.uid} dark />
             </div>
 
-            {/* Monthly NIM */}
             <div style={{
               background: `linear-gradient(135deg, ${moss}, #33452f)`, borderRadius: "14px", padding: "20px",
               color: "#F5F3EC", boxShadow: "0 8px 20px rgba(86,112,90,0.35)",
@@ -1543,6 +1507,7 @@ export default function App() {
         <div style={{ display: "flex", width: "100%", maxWidth: "440px", justifyContent: "space-around" }}>
           {[
             { key: "home", label: "Home", icon: "🏠" },
+            { key: "touch-grass", label: "Grass", icon: "🌿" },
             { key: "competitions", label: "Compete", icon: "🏆" },
             { key: "profile", label: "Profile", icon: "⚙️" },
           ].map((tab) => (
