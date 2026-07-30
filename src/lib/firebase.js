@@ -4,20 +4,16 @@ import { getFirestore } from "firebase/firestore";
 import { getFunctions } from "firebase/functions";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDdVEt1xRoTX8q0V9wFlwdts0xg6FjbEI",
+  apiKey: "AIzaSyDdVEt1xRoTX8q0V9wFlvdwts0xg6FjbEI",
   authDomain: "nimifit.firebaseapp.com",
   projectId: "nimifit",
-  storageBucket: "nimifit.appspot.com",
+  storageBucket: "nimifit.firebasestorage.app",
   messagingSenderId: "683519544082",
   appId: "1:683519544082:web:d48bec148ad1e511b2c1cb",
   measurementId: "G-9W5ZEDFZTZ"
 };
 
 const app = initializeApp(firebaseConfig);
-
-// Immediate Debug Steps (Kif ma ghaffat l-image)
-console.log("Firebase Config:", firebaseConfig);
-console.log("API Key length:", firebaseConfig.apiKey?.length);
 
 export const auth = getAuth(app);
 export const db = getFirestore(app);
