@@ -1,8 +1,15 @@
+# envs & secrets
 .env
 .env.*
-!.env.example
 functions/.env
-functions/.env.*
-!.functions/.env.example
-node_modules
-.DS_Store"functions/" 
+firebase-service-account.json
+FIREBASE_SERVICE_ACCOUNT_KEY
+
+# node
+node_modules/
+dist/
+build/
+
+# misc
+.DS_Store
+.vscode/
