@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.1",
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -10,13 +13,13 @@
   },
   "dependencies": {
     "@nimiq/mini-app-sdk": "^0.1.0",
+    "@vitejs/plugin-react": "^4.3.1",
     "firebase": "^11.0.0",
     "firebase-admin": "^14.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.0"
   }
 }
