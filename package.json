@@ -1,7 +1,6 @@
 {
-  "name": "nimifit-functions",
+  "name": "nimifit",
   "private": true,
-<<<<<<< HEAD
   "version": "0.0.1",
   "type": "module",
   "engines": {
@@ -22,18 +21,5 @@
   },
   "devDependencies": {
     "vite": "^5.4.0"
-=======
-  "engines": {
-    "node": "20"
-  },
-  "main": "index.js",
-  "scripts": {
-    "lint": "node --check index.js"
-  },
-  "dependencies": {
-    "firebase-admin": "^13.0.2",
-    "firebase-functions": "^6.1.1",
-    "vite": "^8.2.0"
->>>>>>> 4b28bce01523a6bf9e46fa66c3da679c9f094068
   }
 }
