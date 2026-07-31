@@ -5,4 +5,8 @@ import "./index.css";
 
 createRoot(document.getElementById("root")).render(
   <StrictMode><App /></StrictMode>
+<<<<<<< HEAD
 );
+=======
+);
+>>>>>>> 4b28bce01523a6bf9e46fa66c3da679c9f094068

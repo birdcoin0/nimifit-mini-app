@@ -18,4 +18,8 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const googleProvider = new GoogleAuthProvider();
+<<<<<<< HEAD
 export const functions = getFunctions(app, "us-central1");
+=======
+export const functions = getFunctions(app, "us-central1");
+>>>>>>> 4b28bce01523a6bf9e46fa66c3da679c9f094068
