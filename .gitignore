@@ -5,4 +5,4 @@ functions/.env
 functions/.env.*
 !.functions/.env.example
 node_modules
-.DS_Store
+.DS_Store"functions/" 
