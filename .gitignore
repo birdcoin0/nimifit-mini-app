@@ -1,5 +1,8 @@
-node_modules 
-.env 
-dist 
-.vercel
-.env*
+.env
+.env.*
+!.env.example
+functions/.env
+functions/.env.*
+!.functions/.env.example
+node_modules
+.DS_Store

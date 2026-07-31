@@ -10,7 +10,7 @@ const firebaseConfig = {
   storageBucket: "nimifit.firebasestorage.app",
   messagingSenderId: "683519544082",
   appId: "1:683519544082:web:d48bec148ad1e511b2c1cb",
-  measurementId: "G-9W5ZEDFZTZ"
+  measurementId: "G-9W5ZEDFZTZ",
 };
 
 const app = initializeApp(firebaseConfig);
@@ -18,4 +18,4 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const googleProvider = new GoogleAuthProvider();
-export const functions = getFunctions(app);
+export const functions = getFunctions(app, "us-central1");

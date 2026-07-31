@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function me(uid) { return signedIn() && request.auth.uid == uid; }
+
+    match /users/{uid} {
+      allow read: if me(uid);
+      allow create: if me(uid)
+        && request.resource.data.keys().hasOnly(['profile', 'displayName', 'email', 'nimiqAddress']);
+      allow update: if me(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['profile', 'displayName', 'email', 'nimiqAddress']);
+      allow delete: if false;
+    }
+
+    match /users/{uid}/days/{dayId} {
+      allow read: if me(uid);
+      allow write: if false;
+    }
+
+    match /users/{uid}/rewards/{rewardId} {
+      allow read, write: if false;
+    }
+
+    match /touch_grass_posts/{postId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /competitions_weekly_tickets_stake/{period}/entries/{entryId} {
+      allow read: if true; allow write: if false;
+    }
+    match /competitions_monthly_tickets_stake/{period}/entries/{entryId} {
+      allow read: if true; allow write: if false;
+    }
+    match /competitions_weekly_water/{period}/entries/{entryId} {
+      allow read: if true; allow write: if false;
+    }
+    match /competitions_monthly_water/{period}/entries/{entryId} {
+      allow read: if true; allow write: if false;
+    }
+    match /competitions_weekly_weight/{period}/entries/{entryId} {
+      allow read: if true; allow write: if false;
+    }
+    match /payments/{paymentId} {
+      allow read, write: if false;
+    }
+  }
+}
